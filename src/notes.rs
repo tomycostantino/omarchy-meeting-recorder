@@ -1,12 +1,14 @@
-//! The teleprompter: a panel next to the recorder with the script of a
-//! voice-over, to read from while recording and to edit on the spot.
+//! Notes: a panel next to the recorder with text to read from while
+//! recording and to edit on the spot, like the script of a voice-over.
 //!
-//! `omarchy-meeting-recorder teleprompter <file>` opens it in the recorder
+//! `omarchy-meeting-recorder notes <file>` opens it in the recorder
 //! window, and so does the [a] in the corner of the recording page. The paragraph with the
 //! cursor is lit and the others are dimmed. Ctrl+↓ and Ctrl+↑, or the buttons
 //! above the text, move to the next and the previous paragraph and keep it in
-//! the middle. Every edit is written back to the file, so whoever made the
-//! script reads what you meant to say.
+//! the middle; so do ↓ and ↑ while the cursor is not in the text. Every edit
+//! is written back to the file, so whoever wrote the notes reads what you
+//! meant to say. A recording made with notes open keeps a copy as `notes.md`
+//! in its meeting folder, and opening that meeting shows them again.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -18,10 +20,13 @@ use gtk::{gdk, glib};
 
 use crate::APP_NAME;
 
-/// The script the [a] button opens when none was open yet: a file of the
-/// app's own, made empty the first time, to type a script in.
-pub fn default_script() -> PathBuf {
-    let path = glib::user_data_dir().join(APP_NAME).join("teleprompter.md");
+/// The notes in a meeting folder, when they were open as it was recorded.
+pub const NOTES_FILE: &str = "notes.md";
+
+/// The notes the [a] button opens when none were open yet: a file of the
+/// app's own, made empty the first time, to type in.
+pub fn default_notes() -> PathBuf {
+    let path = glib::user_data_dir().join(APP_NAME).join("notes.md");
     if !path.exists() {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -59,7 +64,7 @@ pub fn paragraph_at(paragraphs: &[(usize, usize)], offset: usize) -> Option<usiz
         .or_else(|| paragraphs.len().checked_sub(1))
 }
 
-pub struct Teleprompter {
+pub struct Notes {
     pub widget: gtk::Box,
     pub close_button: gtk::Button,
     view: gtk::TextView,
@@ -68,7 +73,7 @@ pub struct Teleprompter {
     position_label: gtk::Label,
     dim: gtk::TextTag,
     path: RefCell<Option<PathBuf>>,
-    /// The script that was open last, for the [a] button to bring back.
+    /// The notes that were open last, for the [a] button to bring back.
     last: RefCell<Option<PathBuf>>,
     /// Set while the file is put in the buffer, so that is not saved again.
     loading: Cell<bool>,
@@ -85,7 +90,7 @@ pub struct Teleprompter {
     scroll_waiting: Cell<bool>,
 }
 
-impl Teleprompter {
+impl Notes {
     /// The panel looks like Omawrite: a centred column of monospaced text on
     /// the theme's background, and a quiet footer with the file and the controls.
     pub fn new() -> Rc<Self> {
@@ -95,7 +100,7 @@ impl Teleprompter {
             .top_margin(220)
             .bottom_margin(320)
             .pixels_below_lines(4)
-            .css_classes(["teleprompter-text"])
+            .css_classes(["notes-text"])
             .build();
         let dim = gtk::TextTag::new(Some("dim"));
         view.buffer().tag_table().add(&dim);
@@ -120,26 +125,26 @@ impl Teleprompter {
         });
 
         let file_label = gtk::Label::builder()
-            .css_classes(["teleprompter-footer"])
+            .css_classes(["notes-footer"])
             .xalign(0.0)
             .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::Middle)
             .build();
         let position_label = gtk::Label::builder()
-            .css_classes(["teleprompter-footer"])
+            .css_classes(["notes-footer"])
             .margin_end(6)
             .build();
         let button = |icon: &str, tooltip: &str| {
             gtk::Button::builder()
                 .icon_name(icon)
                 .tooltip_text(tooltip)
-                .css_classes(["flat", "teleprompter-button"])
+                .css_classes(["flat", "notes-button"])
                 .valign(gtk::Align::Center)
                 .build()
         };
         let previous_button = button("go-up-symbolic", "Previous paragraph (Ctrl+↑)");
         let next_button = button("go-down-symbolic", "Next paragraph (Ctrl+↓)");
-        let close_button = button("window-close-symbolic", "Close the teleprompter");
+        let close_button = button("window-close-symbolic", "Close the notes");
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         footer.set_margin_top(4);
         footer.set_margin_bottom(6);
@@ -152,13 +157,13 @@ impl Teleprompter {
         footer.append(&close_button);
 
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.add_css_class("teleprompter");
+        widget.add_css_class("notes");
         widget.set_hexpand(true);
         widget.set_visible(false);
         widget.append(&scroller);
         widget.append(&footer);
 
-        let prompter = Rc::new(Teleprompter {
+        let prompter = Rc::new(Notes {
             widget,
             close_button,
             view,
@@ -252,7 +257,7 @@ impl Teleprompter {
         self.path.borrow().is_some()
     }
 
-    /// Puts the script in `path` in the panel. Returns false when it cannot be read.
+    /// Puts the notes in `path` in the panel. Returns false when they cannot be read.
     pub fn load(&self, path: &Path) -> bool {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -271,7 +276,6 @@ impl Teleprompter {
         self.file_label.set_tooltip_text(Some(&path.display().to_string()));
         *self.path.borrow_mut() = Some(path.to_owned());
         self.lit.set(None);
-        self.view.grab_focus();
         self.highlight();
         true
     }
@@ -280,7 +284,20 @@ impl Teleprompter {
         *self.last.borrow_mut() = self.path.take();
     }
 
-    /// The script that was open before the teleprompter was closed.
+    /// The file of the notes that are open.
+    pub fn path(&self) -> Option<PathBuf> {
+        self.path.borrow().clone()
+    }
+
+    /// The notes as they stand now, when they are open.
+    pub fn text(&self) -> Option<String> {
+        self.is_loaded().then(|| {
+            let buffer = self.view.buffer();
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string()
+        })
+    }
+
+    /// The notes that were open before the panel was closed.
     pub fn last_path(&self) -> Option<PathBuf> {
         self.last.borrow().clone()
     }
@@ -375,7 +392,7 @@ impl Teleprompter {
 
     /// Moves the cursor to the start of the next or the previous paragraph;
     /// lighting it scrolls it to the middle.
-    fn jump(&self, forward: bool) {
+    pub fn jump(&self, forward: bool) {
         let buffer = self.view.buffer();
         let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
         let paragraphs = paragraphs(&text);

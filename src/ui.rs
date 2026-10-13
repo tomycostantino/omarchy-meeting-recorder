@@ -20,7 +20,7 @@ use crate::export::{self, Format, export_audio, export_tracks};
 use crate::ipc::{self, SharedStatus, Status};
 use crate::meeting::{self, Manifest};
 use crate::player::Player;
-use crate::teleprompter::Teleprompter;
+use crate::notes::Notes;
 use crate::transcribe::{self, Abort, CANCELLED, Event, LANGUAGES};
 use crate::{APP_ID, APP_NAME, settings};
 
@@ -29,8 +29,12 @@ const SYSTEM_COLOR: (f64, f64, f64) = (0.90, 0.38, 0.0);
 const FULL_SIZE: (i32, i32) = (480, 700);
 const COMPACT_SIZE: (i32, i32) = (300, 84);
 const DONE_SIZE: (i32, i32) = (1100, 760);
-/// The recording page with the teleprompter next to it: wider, just as high.
+/// The recording page with the notes next to it: wider, just as high.
 const PROMPTER_SIZE: (i32, i32) = (1100, FULL_SIZE.1);
+/// The done page with the meeting's notes next to the transcript.
+const DONE_NOTES_SIZE: (i32, i32) = (1560, DONE_SIZE.1);
+/// How wide the notes are next to the transcript.
+const DONE_NOTES_WIDTH: i32 = 520;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -204,16 +208,16 @@ impl Hub {
     }
 
     /// A command from the socket: `omarchy-meeting-recorder start` and friends.
-    /// `title` is what came with it: the name for `start`, the script's path for
-    /// `teleprompter`, "" without one.
+    /// `title` is what came with it: the name for `start`, the notes file for
+    /// `notes`, "" without one.
     fn command(self: &Rc<Self>, app: &adw::Application, command: &str, title: &str) {
         if command == "new-window" {
             self.add_window(app).window.present();
             return;
         }
-        if command == "teleprompter" {
+        if command == "notes" {
             let r = self.recording().unwrap_or_else(|| self.free_window(app));
-            r.open_teleprompter(std::path::Path::new(title));
+            r.open_notes(std::path::Path::new(title));
             r.window.present();
             return;
         }
@@ -392,10 +396,14 @@ struct Recorder {
     loading: Cell<bool>,
     /// The settings of the meeting on the done page.
     manifest: RefCell<Option<Manifest>>,
-    /// The script of a voice-over, next to the recording page when one is open.
-    teleprompter: Rc<Teleprompter>,
+    /// Notes to read from, next to the recording page when they are open.
+    notes: Rc<Notes>,
     /// The [a] in the corner of the recording page that opens and closes it.
-    teleprompter_button: gtk::Button,
+    notes_button: gtk::Button,
+    /// The notes file read from while recording, to come back to for the next take.
+    live_notes: RefCell<Option<PathBuf>>,
+    /// The notes on screen are the copy in the meeting on the done page.
+    showing_meeting_notes: Cell<bool>,
 }
 
 impl Recorder {
@@ -430,10 +438,10 @@ impl Recorder {
         let toasts = adw::ToastOverlay::new();
         view.set_content(Some(&toasts));
         view.set_hexpand(true);
-        let teleprompter = Teleprompter::new();
+        let notes = Notes::new();
         let panes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         panes.append(&view);
-        panes.append(&teleprompter.widget);
+        panes.append(&notes.widget);
         window.set_content(Some(&panes));
 
         let content = gtk::Box::builder()
@@ -776,16 +784,16 @@ impl Recorder {
             .build();
         let overlay = gtk::Overlay::builder().child(&layout).build();
         overlay.add_overlay(&drop_hint);
-        let teleprompter_button = gtk::Button::builder()
+        let notes_button = gtk::Button::builder()
             .label("a")
-            .tooltip_text("Teleprompter")
-            .css_classes(["flat", "teleprompter-toggle"])
+            .tooltip_text("Notes")
+            .css_classes(["flat", "notes-toggle"])
             .halign(gtk::Align::End)
             .valign(gtk::Align::End)
             .margin_end(12)
             .margin_bottom(12)
             .build();
-        overlay.add_overlay(&teleprompter_button);
+        overlay.add_overlay(&notes_button);
         toasts.set_child(Some(&overlay));
 
         let compact_action = gio::SimpleAction::new("compact", None);
@@ -864,8 +872,10 @@ impl Recorder {
             quit_when_done: Cell::new(false),
             loading: Cell::new(false),
             manifest: RefCell::default(),
-            teleprompter,
-            teleprompter_button,
+            notes,
+            notes_button,
+            live_notes: RefCell::default(),
+            showing_meeting_notes: Cell::new(false),
         });
         recorder.connect_signals(&open_button, &new_button);
         recorder.render();
@@ -874,20 +884,52 @@ impl Recorder {
 
     fn connect_signals(self: &Rc<Self>, open_button: &gtk::Button, new_button: &gtk::Button) {
         let weak = Rc::downgrade(self);
-        self.teleprompter.close_button.connect_clicked(move |_| {
+        self.notes.close_button.connect_clicked(move |_| {
             let Some(r) = weak.upgrade() else { return };
-            r.teleprompter.unload();
+            r.notes.unload();
             r.show_page();
         });
+        // ↓ and ↑ go to the next and previous paragraph, like the buttons, as
+        // long as the cursor is not in the notes or in a field to type in.
+        let arrows = gtk::EventControllerKey::new();
+        arrows.set_propagation_phase(gtk::PropagationPhase::Capture);
+        self.window.add_controller(arrows.clone());
         let weak = Rc::downgrade(self);
-        self.teleprompter_button.connect_clicked(move |_| {
+        arrows.connect_key_pressed(move |_, key, _, modifiers| {
+            let Some(r) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let forward = match key {
+                gtk::gdk::Key::Down => true,
+                gtk::gdk::Key::Up => false,
+                _ => return glib::Propagation::Proceed,
+            };
+            let typing = gtk::prelude::GtkWindowExt::focus(&r.window)
+                .is_some_and(|w| w.is::<gtk::Text>() || w.is::<gtk::TextView>());
+            if !r.notes.widget.is_visible()
+                || typing
+                || modifiers.intersects(
+                    gtk::gdk::ModifierType::CONTROL_MASK
+                        | gtk::gdk::ModifierType::ALT_MASK
+                        | gtk::gdk::ModifierType::SHIFT_MASK
+                        | gtk::gdk::ModifierType::SUPER_MASK,
+                )
+            {
+                return glib::Propagation::Proceed;
+            }
+            r.notes.jump(forward);
+            glib::Propagation::Stop
+        });
+
+        let weak = Rc::downgrade(self);
+        self.notes_button.connect_clicked(move |_| {
             let Some(r) = weak.upgrade() else { return };
-            if r.teleprompter.is_loaded() {
-                r.teleprompter.unload();
+            if r.notes.is_loaded() {
+                r.notes.unload();
                 r.show_page();
             } else {
-                let path = r.teleprompter.last_path().unwrap_or_else(crate::teleprompter::default_script);
-                r.open_teleprompter(&path);
+                let path = r.notes.last_path().unwrap_or_else(crate::notes::default_notes);
+                r.open_notes(&path);
             }
         });
 
@@ -1456,24 +1498,44 @@ impl Recorder {
         });
     }
 
-    /// Opens the script in `path` in the teleprompter on the recording page.
-    fn open_teleprompter(&self, path: &std::path::Path) {
-        if self.teleprompter.load(path) {
+    /// Opens the notes in `path` next to the recording page.
+    fn open_notes(&self, path: &std::path::Path) {
+        if self.notes.load(path) {
             self.show_page();
         }
     }
 
-    /// With a script open on the recording page the teleprompter sits next to
+    /// With notes open on the recording page they sit next to
     /// the recorder, which keeps its own width. Returns whether it is on screen.
-    fn arrange_teleprompter(&self) -> bool {
-        let recording_page = !self.compact.get()
-            && self.layout.visible_child_name().as_deref() == Some("record");
-        let prompting = recording_page && self.teleprompter.is_loaded();
-        self.teleprompter_button.set_visible(recording_page);
-        self.teleprompter.widget.set_visible(prompting);
-        self.view.set_hexpand(!prompting);
-        self.view.set_size_request(if prompting { FULL_SIZE.0 } else { -1 }, -1);
-        prompting
+    fn arrange_notes(&self) -> bool {
+        let page = if self.compact.get() {
+            None
+        } else {
+            self.layout.visible_child_name()
+        };
+        let recording_page = page.as_deref() == Some("record");
+        let done_page = page.as_deref() == Some("done");
+        let shown = (recording_page || done_page) && self.notes.is_loaded();
+        self.notes_button.set_visible(recording_page);
+        self.notes.widget.set_visible(shown);
+        // Next to the recorder the notes take the room; next to a transcript, the transcript does.
+        let beside_recorder = shown && recording_page;
+        self.view.set_hexpand(!beside_recorder);
+        self.view.set_size_request(if beside_recorder { FULL_SIZE.0 } else { -1 }, -1);
+        self.notes.widget.set_hexpand(beside_recorder);
+        self.notes.widget.set_size_request(if shown && done_page { DONE_NOTES_WIDTH } else { -1 }, -1);
+        shown
+    }
+
+    /// The done page shows the notes the meeting was recorded with, when it has any.
+    fn show_meeting_notes(&self, dir: &std::path::Path) {
+        let file = dir.join(crate::notes::NOTES_FILE);
+        if file.exists() && self.notes.load(&file) {
+            self.showing_meeting_notes.set(true);
+        } else if self.showing_meeting_notes.replace(false) || self.notes.is_loaded() {
+            self.notes.unload();
+        }
+        self.show_page();
     }
 
     fn set_state(&self, state: State) {
@@ -1570,14 +1632,13 @@ impl Recorder {
             _ => "record",
         };
         self.layout.set_visible_child_name(page);
-        let prompting = self.arrange_teleprompter();
+        let prompting = self.arrange_notes();
         // Recording and transcribing share one size, so stopping does not jump.
-        self.fit_window(if page == "done" {
-            DONE_SIZE
-        } else if prompting {
-            PROMPTER_SIZE
-        } else {
-            FULL_SIZE
+        self.fit_window(match (page, prompting) {
+            ("done", true) => DONE_NOTES_SIZE,
+            ("done", false) => DONE_SIZE,
+            ("record", true) => PROMPTER_SIZE,
+            _ => FULL_SIZE,
         });
         let immersive = matches!(state, State::Stopping | State::Transcribing);
         self.view.set_extend_content_to_top_edge(immersive);
@@ -1597,6 +1658,8 @@ impl Recorder {
         }
         let minimum = if size == DONE_SIZE {
             (820, 560)
+        } else if size == DONE_NOTES_SIZE {
+            (820 + DONE_NOTES_WIDTH, 560)
         } else if size == PROMPTER_SIZE {
             (900, 600)
         } else {
@@ -1642,7 +1705,7 @@ impl Recorder {
                 self.full_size.set((w, h));
             }
             self.layout.set_visible_child_name("compact");
-            self.arrange_teleprompter();
+            self.arrange_notes();
             self.view.set_reveal_top_bars(false);
             // libadwaita keeps every window at least 360x200 unless told otherwise.
             self.window.set_size_request(COMPACT_SIZE.0, COMPACT_SIZE.1);
@@ -2014,6 +2077,13 @@ impl Recorder {
         self.title_row.set_text("");
         self.timer.set_label("00:00");
         self.compact_timer.set_label("00:00");
+        // The meeting's notes stay with the meeting; the ones recorded with come back.
+        if self.showing_meeting_notes.replace(false) {
+            self.notes.unload();
+            if let Some(live) = self.live_notes.borrow().clone() {
+                self.notes.load(&live);
+            }
+        }
         self.set_state(State::Idle);
         self.update_model_banner();
     }
@@ -2093,6 +2163,11 @@ impl Recorder {
         let format = self.selected_format();
         let language = self.selected_language();
         let out = output_dir(self.started_at.get(), &self.title());
+        // The notes read from, as they stood when the recording stopped.
+        let script = self.notes.text();
+        if !self.showing_meeting_notes.get() {
+            *self.live_notes.borrow_mut() = self.notes.path();
+        }
         let this = self.clone();
         glib::spawn_future_local(async move {
             let (audio_out, audio_staging) = (out.clone(), staging.clone());
@@ -2126,6 +2201,9 @@ impl Recorder {
                 chapters_by: None,
             };
             let _ = meeting::write(&out, &manifest);
+            if let Some(script) = script {
+                let _ = std::fs::write(out.join(crate::notes::NOTES_FILE), script);
+            }
             *this.manifest.borrow_mut() = Some(manifest);
             *this.result_dir.borrow_mut() = Some(out);
 
@@ -2324,6 +2402,9 @@ impl Recorder {
     fn finished(self: &Rc<Self>, audio_ok: bool, transcript: Result<(), String>) {
         self.done_title_row.set_text(&self.title_row.text());
         self.set_state(State::Done);
+        if let Some(dir) = self.result_dir.borrow().clone() {
+            self.show_meeting_notes(&dir);
+        }
         // Follow a name that was edited while the transcription ran.
         self.apply_title();
 
@@ -2443,6 +2524,7 @@ impl Recorder {
         *self.manifest.borrow_mut() = Some(manifest);
         *self.result_dir.borrow_mut() = Some(dir.clone());
         self.set_state(State::Done);
+        self.show_meeting_notes(&dir);
         let text = std::fs::read_to_string(dir.join("transcript.md")).ok();
         let problem = text
             .is_none()
@@ -3734,18 +3816,18 @@ fn load_css() {
          .transcript-editor text { background: transparent; }
          .done-icon { color: @accent_color; }
          .player { padding: 6px 14px 6px 6px; }
-         .teleprompter { background: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.1); }
-         .teleprompter-toggle { min-height: 24px; min-width: 24px; padding: 0 6px; border-radius: 6px;
+         .notes { background: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.1); }
+         .notes-toggle { min-height: 24px; min-width: 24px; padding: 0 6px; border-radius: 6px;
                                 border: 1px solid alpha(currentColor, 0.25); font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", monospace;
                                 font-size: 13px; color: alpha(currentColor, 0.6); }
-         .teleprompter-toggle:hover { color: currentColor; }
-         .teleprompter-text { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
+         .notes-toggle:hover { color: currentColor; }
+         .notes-text { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
                               font-size: 21px; line-height: 1.6; background: transparent; caret-color: currentColor; }
-         .teleprompter-text text { background: transparent; }
-         .teleprompter-footer { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
+         .notes-text text { background: transparent; }
+         .notes-footer { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
                                 font-size: 11px; color: alpha(currentColor, 0.5); }
-         .teleprompter-button { min-height: 26px; min-width: 26px; padding: 2px; color: alpha(currentColor, 0.5); }
-         .teleprompter-button:hover { color: currentColor; }",
+         .notes-button { min-height: 26px; min-width: 26px; padding: 2px; color: alpha(currentColor, 0.5); }
+         .notes-button:hover { color: currentColor; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(

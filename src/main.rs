@@ -16,7 +16,7 @@ mod models;
 mod nemotron;
 mod player;
 mod settings;
-mod teleprompter;
+mod notes;
 mod theme;
 mod transcribe;
 mod ui;
@@ -78,15 +78,15 @@ fn main() -> glib::ExitCode {
             }
         }
         // Only from the command line: there is no button for it in the app.
-        Some("teleprompter") => {
+        Some("notes") => {
             let line = std::env::args()
                 .nth(2)
                 .and_then(|path| std::fs::canonicalize(path).ok())
-                .and_then(|path| ipc::teleprompter_line(&path));
+                .and_then(|path| ipc::notes_line(&path));
             match line {
                 Some(line) => send_or_open(line),
                 None => {
-                    eprintln!("{APP_NAME}: teleprompter needs a text file that exists");
+                    eprintln!("{APP_NAME}: notes needs a text file that exists");
                     glib::ExitCode::from(2)
                 }
             }
@@ -108,7 +108,7 @@ fn main() -> glib::ExitCode {
         Some("ask") => agent::cli(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("-h" | "--help") => {
             println!(
-                "Usage: {APP_NAME} [start [name] | stop | pause | compact | watch | wait [--audio] | teleprompter <file> | transcribe <mic> <computer> [--language xx]]"
+                "Usage: {APP_NAME} [start [name] | stop | pause | compact | watch | wait [--audio] | notes <file> | transcribe <mic> <computer> [--language xx]]"
             );
             println!();
             println!("  (no command)  open the recorder, ready to record");
@@ -122,7 +122,7 @@ fn main() -> glib::ExitCode {
                 "  wait          wait until the recording is done and print its folder (--audio: once the audio is saved)"
             );
             println!(
-                "  teleprompter  show a script next to the recorder, to read and edit while recording"
+                "  notes <file>  show notes next to the recorder, to read from and edit while recording"
             );
             println!("  transcribe    transcribe two tracks and print the transcript as Markdown");
             println!(

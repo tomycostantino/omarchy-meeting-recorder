@@ -84,18 +84,18 @@ pub fn now() -> i64 {
 }
 
 /// Commands a client may send, one per line. `start` may be followed by a
-/// space and the meeting's name, `teleprompter` by the path of a script.
+/// space and the meeting's name, `notes` by the path of a notes file.
 pub const COMMANDS: [&str; 6] = [
     "start",
     "stop",
     "compact",
     "pause",
     "new-window",
-    "teleprompter",
+    "notes",
 ];
 
 /// A command from a client, and what came with it: the name for `start`, the
-/// script's path for `teleprompter` ("" without).
+/// notes file's path for `notes` ("" without).
 pub type Command = (&'static str, String);
 
 /// Starts the socket server. Called once, from the primary instance. Clients
@@ -198,7 +198,7 @@ fn parse_command(line: &str) -> Option<Command> {
     let line = line.trim();
     let (name, title) = match line.split_once(' ') {
         Some(("start", title)) => ("start", title.trim()),
-        Some(("teleprompter", path)) => ("teleprompter", path.trim()),
+        Some(("notes", path)) => ("notes", path.trim()),
         _ => (line, ""),
     };
     COMMANDS
@@ -222,11 +222,11 @@ pub fn start_line(title: &[String]) -> String {
     }
 }
 
-/// `omarchy-meeting-recorder teleprompter <file>`: the line that opens the
-/// teleprompter on that script. None for a path that would add a line.
-pub fn teleprompter_line(path: &std::path::Path) -> Option<String> {
+/// `omarchy-meeting-recorder notes <file>`: the line that opens those notes.
+/// None for a path that would add a line.
+pub fn notes_line(path: &std::path::Path) -> Option<String> {
     let path = path.to_str()?;
-    (!path.contains('\n') && !path.trim().is_empty()).then(|| format!("teleprompter {path}"))
+    (!path.contains('\n') && !path.trim().is_empty()).then(|| format!("notes {path}"))
 }
 
 /// `omarchy-meeting-recorder stop`: ask the running app to stop recording.
@@ -348,17 +348,17 @@ mod tests {
     }
 
     #[test]
-    fn the_teleprompter_takes_a_path() {
+    fn notes_take_a_path() {
         assert_eq!(
-            parse_command("teleprompter /tmp/a script.md\n"),
-            Some(("teleprompter", "/tmp/a script.md".into()))
+            parse_command("notes /tmp/a script.md\n"),
+            Some(("notes", "/tmp/a script.md".into()))
         );
         let path = std::path::Path::new("/tmp/a script.md");
         assert_eq!(
-            teleprompter_line(path).as_deref(),
-            Some("teleprompter /tmp/a script.md")
+            notes_line(path).as_deref(),
+            Some("notes /tmp/a script.md")
         );
-        assert_eq!(teleprompter_line(std::path::Path::new("/tmp/a\nstop")), None);
+        assert_eq!(notes_line(std::path::Path::new("/tmp/a\nstop")), None);
     }
 
     #[test]
