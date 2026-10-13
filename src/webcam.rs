@@ -73,7 +73,7 @@ fn ffmpeg() -> Command {
 }
 
 /// Takes the first whole JPEG off the front of `buffer`, dropping what came before it.
-fn take_jpeg(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+pub(crate) fn take_jpeg(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     let start = buffer.windows(2).position(|w| w == [0xFF, 0xD8])?;
     let end = buffer[start + 2..].windows(2).position(|w| w == [0xFF, 0xD9])? + start + 4;
     let frame = buffer[start..end].to_vec();

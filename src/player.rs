@@ -5,7 +5,10 @@
 //! has no GStreamer audio sink, while `pacat` comes with the same package as
 //! the `parec` the recorder already records with. Pausing stops the pipeline
 //! and playing starts it again at the position; a meeting saved as separate
-//! files is mixed on the fly.
+//! files is mixed on the fly. A meeting with a `webcam.mp4` shows it small
+//! (`video_widget`, which the page lays over the transcript): a second ffmpeg decodes its frames ahead, each
+//! stamped with its time, and the frame whose time the audio has reached is
+//! shown; a still of the position stands in while paused.
 
 use std::cell::{Cell, RefCell};
 use std::os::unix::process::CommandExt;
@@ -25,16 +28,23 @@ const SYSTEM_COLOR: (f64, f64, f64) = (0.90, 0.38, 0.0);
 
 type PositionCallback = Rc<RefCell<Option<Box<dyn Fn(i64)>>>>;
 
-/// A running `ffmpeg | pacat` pipeline, stopped when dropped.
+/// Frames of the webcam a second ahead, as (time in µs, JPEG).
+type VideoFrames = async_channel::Receiver<(i64, Vec<u8>)>;
+
+/// A running `ffmpeg | pacat` pipeline, stopped when dropped, with the
+/// webcam's frames alongside when there is a video.
 struct Playback {
     ffmpeg: Child,
     pacat: Child,
+    video: Option<(Child, VideoFrames)>,
+    /// A frame read ahead whose time has not come yet.
+    next_frame: Option<(i64, Vec<u8>)>,
     started: Instant,
     from_us: i64,
 }
 
 impl Playback {
-    fn start(files: &[PathBuf], from_us: i64) -> Option<Playback> {
+    fn start(files: &[PathBuf], from_us: i64, video: Option<&Path>) -> Option<Playback> {
         let at = format!("{:.3}", from_us as f64 / 1_000_000.0);
         let mut ffmpeg = Command::new("ffmpeg");
         ffmpeg.args(["-v", "error", "-nostdin"]);
@@ -73,6 +83,8 @@ impl Playback {
             Ok(pacat) => Some(Playback {
                 ffmpeg,
                 pacat,
+                video: video.and_then(|path| play_video(path, from_us)),
+                next_frame: None,
                 started: Instant::now(),
                 from_us,
             }),
@@ -91,6 +103,24 @@ impl Playback {
     fn ended(&mut self) -> bool {
         matches!(self.pacat.try_wait(), Ok(Some(_)))
     }
+
+    /// The newest frame whose time the audio has reached, if a new one is due.
+    fn due_frame(&mut self) -> Option<Vec<u8>> {
+        let now = self.position_us();
+        let (_, frames) = self.video.as_ref()?;
+        let mut due = None;
+        loop {
+            let Some((at, frame)) = self.next_frame.take().or_else(|| frames.try_recv().ok()) else {
+                break;
+            };
+            if at > now {
+                self.next_frame = Some((at, frame));
+                break;
+            }
+            due = Some(frame);
+        }
+        due
+    }
 }
 
 impl Drop for Playback {
@@ -99,7 +129,64 @@ impl Drop for Playback {
         let _ = self.pacat.kill();
         let _ = self.ffmpeg.wait();
         let _ = self.pacat.wait();
+        if let Some((video, _)) = self.video.as_mut() {
+            let _ = video.kill();
+            let _ = video.wait();
+        }
     }
+}
+
+/// Frames per second of the small webcam picture.
+const VIDEO_FPS: i64 = 15;
+
+/// Decodes the webcam from `from_us` on, a second ahead of the audio at
+/// most: frame n of the even stream the fps filter makes is at
+/// `from_us + n / VIDEO_FPS`.
+fn play_video(path: &Path, from_us: i64) -> Option<(Child, VideoFrames)> {
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-v", "error", "-nostdin", "-ss", &format!("{:.3}", from_us as f64 / 1_000_000.0), "-i"])
+        .arg(path)
+        .args(["-an", "-vf", &format!("scale=480:-2,fps={VIDEO_FPS}"), "-c:v", "mjpeg", "-q:v", "6"])
+        .args(["-f", "image2pipe", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = die_with_parent(&mut command).spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (frames, received) = async_channel::bounded(VIDEO_FPS as usize);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 65536];
+        let mut n: i64 = 0;
+        while let Ok(read) = stdout.read(&mut chunk) {
+            if read == 0 {
+                return;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            while let Some(frame) = crate::webcam::take_jpeg(&mut buffer) {
+                // Waits while a second of frames is queued: ffmpeg waits with it.
+                if frames.send_blocking((from_us + n * 1_000_000 / VIDEO_FPS, frame)).is_err() {
+                    return;
+                }
+                n += 1;
+            }
+        }
+    });
+    Some((child, received))
+}
+
+/// One frame of the webcam at `us`, as a JPEG, for while nothing plays.
+fn still(path: &Path, us: i64) -> Option<Vec<u8>> {
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-ss", &format!("{:.3}", us as f64 / 1_000_000.0), "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-vf", "scale=480:-2", "-c:v", "mjpeg", "-q:v", "4"])
+        .args(["-f", "image2pipe", "pipe:1"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    (output.status.success() && !output.stdout.is_empty()).then_some(output.stdout)
 }
 
 /// Makes the child get SIGTERM when the app goes away, even after a crash, so
@@ -137,6 +224,8 @@ fn probe_duration_us(path: &Path) -> i64 {
 #[derive(Default)]
 struct State {
     files: Vec<PathBuf>,
+    /// The meeting's webcam.mp4, when it has one.
+    video: Option<PathBuf>,
     duration_us: i64,
     /// Where playback starts from next, while paused.
     paused_at_us: i64,
@@ -151,7 +240,7 @@ struct State {
 
 impl State {
     fn relocate(&mut self, from: &Path, to: &Path) {
-        for path in &mut self.files {
+        for path in self.files.iter_mut().chain(self.video.as_mut()) {
             if let Ok(relative) = path.strip_prefix(from) {
                 *path = to.join(relative);
             }
@@ -163,6 +252,10 @@ impl State {
 pub struct Player {
     root: gtk::Box,
     button: gtk::Button,
+    /// The webcam, small, when the meeting has one.
+    video: gtk::Picture,
+    video_box: adw::Clamp,
+    frames: async_channel::Sender<Vec<u8>>,
     wave: gtk::DrawingArea,
     time: gtk::Label,
     state: Rc<RefCell<State>>,
@@ -194,6 +287,29 @@ impl Player {
             .css_classes(["card", "player"])
             .build();
 
+        let video = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .can_shrink(true)
+            .css_classes(["player-video"])
+            .build();
+        video.set_overflow(gtk::Overflow::Hidden);
+        // Small, whatever size the frames are: they are wider, for a sharp picture on HiDPI.
+        let video_box = adw::Clamp::builder()
+            .maximum_size(240)
+            .tightening_threshold(240)
+            .child(&video)
+            .visible(false)
+            .build();
+        let (frames, frames_rx) = async_channel::bounded::<Vec<u8>>(2);
+        let picture = video.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(frame) = frames_rx.recv().await {
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(frame)) {
+                    picture.set_paintable(Some(&texture));
+                }
+            }
+        });
+
         root.append(&button);
         root.append(&wave);
         root.append(&time);
@@ -201,6 +317,9 @@ impl Player {
         let player = Player {
             root,
             button,
+            video,
+            video_box,
+            frames,
             wave,
             time,
             state: Rc::default(),
@@ -246,6 +365,11 @@ impl Player {
         player
     }
 
+    /// The webcam picture, for the page to lay where it fits; hidden without a video.
+    pub fn video_widget(&self) -> &adw::Clamp {
+        &self.video_box
+    }
+
     pub fn widget(&self) -> &gtk::Box {
         &self.root
     }
@@ -274,11 +398,14 @@ impl Player {
                 .max()
                 .unwrap_or(0);
             state.files = playable.clone();
+            state.video = Some(dir.join(crate::webcam::FILE)).filter(|path| path.is_file());
             state.paused_at_us = 0;
             state.generation += 1;
             state.generation
         };
         self.root.set_visible(!playable.is_empty());
+        self.video_box.set_visible(self.state.borrow().video.is_some());
+        self.show_still(0);
 
         // The kept tracks give each side its own lane; without them, one lane.
         let (mic, computer) = export::tracks(dir);
@@ -342,6 +469,9 @@ impl Player {
         let mut state = self.state.borrow_mut();
         state.playback = None;
         state.files.clear();
+        state.video = None;
+        self.video_box.set_visible(false);
+        self.video.set_paintable(None::<&gtk::gdk::Paintable>);
         state.duration_us = 0;
         state.paused_at_us = 0;
         state.peaks = None;
@@ -385,12 +515,14 @@ impl Player {
                 state.paused_at_us = 0;
             }
             state.playback = None;
-            state.playback = Playback::start(&state.files, state.paused_at_us);
+            let video = state.video.clone();
+            state.playback = Playback::start(&state.files, state.paused_at_us, video.as_deref());
             state.playback.is_some()
         };
         self.set_playing_icon(started);
         if started {
             self.start_ticking();
+            self.start_showing_video();
         }
     }
 
@@ -402,7 +534,44 @@ impl Player {
             state.paused_at_us = position;
         }
         self.set_playing_icon(false);
+        self.show_still(position);
         self.refresh();
+    }
+
+    /// While playing, puts the frame the audio has reached on screen, thirty times a second.
+    fn start_showing_video(&self) {
+        if self.state.borrow().video.is_none() {
+            return;
+        }
+        let this = self.clone();
+        glib::timeout_add_local(Duration::from_millis(33), move || {
+            let mut state = this.state.borrow_mut();
+            let Some(playback) = state.playback.as_mut() else {
+                return glib::ControlFlow::Break;
+            };
+            if playback.video.is_none() {
+                return glib::ControlFlow::Break;
+            }
+            if let Some(frame) = playback.due_frame()
+                && let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(frame))
+            {
+                this.video.set_paintable(Some(&texture));
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Shows the webcam at `us` while nothing plays.
+    fn show_still(&self, us: i64) {
+        let Some(path) = self.state.borrow().video.clone() else {
+            return;
+        };
+        let frames = self.frames.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Some(frame)) = gio::spawn_blocking(move || still(&path, us)).await {
+                let _ = frames.send(frame).await;
+            }
+        });
     }
 
     /// Jumps to `ms` and plays from there, for a click on the transcript.
@@ -417,6 +586,8 @@ impl Player {
         self.state.borrow_mut().paused_at_us = us;
         if playing {
             self.play();
+        } else {
+            self.show_still(us);
         }
         self.refresh();
     }
