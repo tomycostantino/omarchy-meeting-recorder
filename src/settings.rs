@@ -1,5 +1,6 @@
 //! Remembered preferences: the audio format, the transcription language,
-//! the name you go by in transcripts and whether the bar widget was offered.
+//! the webcam, the name you go by in transcripts and whether the bar widget
+//! was offered.
 
 use std::path::PathBuf;
 
@@ -60,6 +61,15 @@ pub fn load_language() -> &'static str {
 
 pub fn save_language(code: &str) {
     save("language", code);
+}
+
+/// The name of the webcam to record, "" for none.
+pub fn load_webcam() -> String {
+    load()["webcam"].as_str().unwrap_or_default().to_owned()
+}
+
+pub fn save_webcam(name: &str) {
+    save("webcam", name);
 }
 
 /// What the mic side is called in new transcripts, "You" until you change it.

@@ -317,6 +317,10 @@ struct Recorder {
     title_row: adw::EntryRow,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
+    /// Off, or the camera to record next to the audio.
+    webcam_row: adw::ComboRow,
+    webcam_devices: Vec<(PathBuf, String)>,
+    webcam: crate::webcam::Webcam,
     animation: TranscribeAnimation,
     meters: [gtk::DrawingArea; 2],
     compact_meters: [gtk::DrawingArea; 2],
@@ -477,9 +481,25 @@ impl Recorder {
                 .position(|(code, _)| *code == saved)
                 .unwrap_or(0) as u32,
         );
+        let webcam_devices = crate::webcam::devices();
+        let mut webcam_labels = vec!["Off"];
+        webcam_labels.extend(webcam_devices.iter().map(|(_, name)| name.as_str()));
+        let webcam_row = adw::ComboRow::builder()
+            .title("Webcam")
+            .subtitle("Recorded as webcam.mp4 next to the audio")
+            .model(&gtk::StringList::new(&webcam_labels))
+            .build();
+        let saved = settings::load_webcam();
+        webcam_row.set_selected(
+            webcam_devices
+                .iter()
+                .position(|(_, name)| *name == saved)
+                .map_or(0, |i| i + 1) as u32,
+        );
         group.add(&title_row);
         group.add(&format_row);
         group.add(&language_row);
+        group.add(&webcam_row);
         content.append(&group);
 
         let frozen: [Frozen; 2] = Default::default();
@@ -808,6 +828,9 @@ impl Recorder {
             title_row,
             format_row,
             language_row,
+            webcam_row,
+            webcam_devices,
+            webcam: crate::webcam::Webcam::default(),
             animation,
             meters,
             compact_meters,
@@ -1034,6 +1057,14 @@ impl Recorder {
         });
 
         // Ctrl+Q goes through the same check as the close button.
+
+        let weak = Rc::downgrade(self);
+        self.webcam_row.connect_selected_notify(move |_| {
+            if let Some(r) = weak.upgrade() {
+                let name = r.selected_webcam().map(|(_, name)| name).unwrap_or_default();
+                settings::save_webcam(&name);
+            }
+        });
 
         let weak = Rc::downgrade(self);
         self.format_row.connect_selected_notify(move |_| {
@@ -1494,6 +1525,12 @@ impl Recorder {
         });
     }
 
+    /// The camera picked to record, as (device, name); None when it is off.
+    fn selected_webcam(&self) -> Option<(PathBuf, String)> {
+        let index = usize::try_from(self.webcam_row.selected()).ok()?;
+        index.checked_sub(1).and_then(|i| self.webcam_devices.get(i).cloned())
+    }
+
     /// Opens the notes in `path` next to the recording page.
     fn open_notes(&self, path: &std::path::Path) {
         if self.notes.load(path) {
@@ -1561,6 +1598,8 @@ impl Recorder {
     fn render(&self) {
         let state = self.state.get();
         let recording = state == State::Recording;
+        self.webcam_row
+            .set_sensitive(matches!(state, State::Idle | State::Done));
         self.dot.set_visible(recording);
         self.compact_button.set_visible(recording);
         self.compact_action.set_enabled(recording);
@@ -1746,6 +1785,11 @@ impl Recorder {
         }
         self.mic.set_paused(self.paused.get());
         self.system.set_paused(self.paused.get());
+        if self.paused.get() {
+            self.webcam.pause();
+        } else {
+            self.webcam.resume();
+        }
         self.freeze_meters(self.paused.get());
         self.set_state(State::Recording);
         self.tick();
@@ -2123,6 +2167,9 @@ impl Recorder {
             self.selected_format(),
             self.selected_language(),
         );
+        if let Some((device, _)) = self.selected_webcam() {
+            self.webcam.start(&device, &staging);
+        }
         *self.staging.borrow_mut() = Some(staging);
         *self.result_dir.borrow_mut() = None;
         self.player.unload();
@@ -2145,6 +2192,7 @@ impl Recorder {
         self.animation_since.set(Some(std::time::Instant::now()));
         self.mic.stop_recording();
         self.system.stop_recording();
+        let webcam = self.webcam.stop();
         let Some(staging) = self.staging.borrow().clone() else {
             return;
         };
@@ -2174,6 +2222,7 @@ impl Recorder {
                 );
                 let audio = export_audio(&mic, &system, &audio_out, format);
                 let tracks = export_tracks(&mic, &system, &audio_out);
+                crate::webcam::export(&audio_staging, &audio_out, webcam);
                 (audio, tracks)
             })
             .await
