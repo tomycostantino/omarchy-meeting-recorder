@@ -8,8 +8,12 @@
 //!
 //! A line looks like:
 //! {"state":"recording","elapsed":754,"title":"Weekly","mic":0.62,"computer":0.31,"progress":0.0}
-//! with `mic` and `computer` as meter levels from 0 to 1, and `progress` the
-//! transcription progress from 0 to 1 while the state is "transcribing".
+//! with `mic` and `computer` as meter levels from 0 to 1, `progress` the
+//! transcription progress from 0 to 1 while the state is "transcribing", and
+//! `folder` the meeting's folder once it has one ("" before).
+//!
+//! `omarchy-meeting-recorder wait` reads the same lines to wait for a meeting
+//! to be done and print its folder, for scripts and agents.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -35,6 +39,8 @@ pub struct Status {
     pub pause_began: i64,
     pub title: String,
     pub progress: f64,
+    /// The meeting's folder, once it has one.
+    pub folder: String,
 }
 
 pub type SharedStatus = Arc<Mutex<Status>>;
@@ -78,10 +84,18 @@ pub fn now() -> i64 {
 }
 
 /// Commands a client may send, one per line. `start` may be followed by a
-/// space and the meeting's name.
-pub const COMMANDS: [&str; 5] = ["start", "stop", "compact", "pause", "new-window"];
+/// space and the meeting's name, `teleprompter` by the path of a script.
+pub const COMMANDS: [&str; 6] = [
+    "start",
+    "stop",
+    "compact",
+    "pause",
+    "new-window",
+    "teleprompter",
+];
 
-/// A command from a client, and the name that came with `start` ("" without).
+/// A command from a client, and what came with it: the name for `start`, the
+/// script's path for `teleprompter` ("" without).
 pub type Command = (&'static str, String);
 
 /// Starts the socket server. Called once, from the primary instance. Clients
@@ -141,6 +155,7 @@ pub fn serve(
                 "mic": round(to_meter(mic.recent_peak(3))),
                 "computer": round(to_meter(system.recent_peak(3))),
                 "progress": round(snapshot.progress),
+                "folder": snapshot.folder,
             })
             .to_string()
                 + "\n";
@@ -183,6 +198,7 @@ fn parse_command(line: &str) -> Option<Command> {
     let line = line.trim();
     let (name, title) = match line.split_once(' ') {
         Some(("start", title)) => ("start", title.trim()),
+        Some(("teleprompter", path)) => ("teleprompter", path.trim()),
         _ => (line, ""),
     };
     COMMANDS
@@ -206,12 +222,66 @@ pub fn start_line(title: &[String]) -> String {
     }
 }
 
+/// `omarchy-meeting-recorder teleprompter <file>`: the line that opens the
+/// teleprompter on that script. None for a path that would add a line.
+pub fn teleprompter_line(path: &std::path::Path) -> Option<String> {
+    let path = path.to_str()?;
+    (!path.contains('\n') && !path.trim().is_empty()).then(|| format!("teleprompter {path}"))
+}
+
 /// `omarchy-meeting-recorder stop`: ask the running app to stop recording.
 pub fn send(command: &str) -> bool {
     match UnixStream::connect(socket_path()) {
         Ok(mut stream) => stream.write_all(format!("{command}\n").as_bytes()).is_ok(),
         Err(_) => false,
     }
+}
+
+/// `omarchy-meeting-recorder wait [--audio]`: waits until the meeting that
+/// is being recorded is done and prints its folder. With `audio_only` it is
+/// back as soon as the audio is saved, before the transcript. Started before
+/// the recorder, it waits for it. False when the recorder closes before the
+/// meeting is done.
+pub fn wait(audio_only: bool) -> bool {
+    let mut busy = false;
+    loop {
+        let Ok(stream) = UnixStream::connect(socket_path()) else {
+            if busy {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.by_ref().take(MAX_LINE as u64).read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(status) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let state = status["state"].as_str().unwrap_or_default();
+            let folder = status["folder"].as_str().unwrap_or_default();
+            if let Some(done) = finished(state, folder, busy, audio_only) {
+                println!("{done}");
+                return true;
+            }
+            busy |= matches!(state, "recording" | "paused" | "stopping" | "transcribing");
+        }
+    }
+}
+
+/// The folder to print once the meeting `wait` waits for is far enough along.
+fn finished<'a>(state: &str, folder: &'a str, busy: bool, audio_only: bool) -> Option<&'a str> {
+    let far_enough = match state {
+        "done" => busy,
+        "transcribing" => audio_only,
+        _ => false,
+    };
+    (far_enough && !folder.is_empty()).then_some(folder)
 }
 
 fn round(value: f64) -> f64 {
@@ -275,6 +345,31 @@ mod tests {
         // Only start takes a name.
         assert_eq!(parse_command("stop now\n"), None);
         assert_eq!(parse_command("starting\n"), None);
+    }
+
+    #[test]
+    fn the_teleprompter_takes_a_path() {
+        assert_eq!(
+            parse_command("teleprompter /tmp/a script.md\n"),
+            Some(("teleprompter", "/tmp/a script.md".into()))
+        );
+        let path = std::path::Path::new("/tmp/a script.md");
+        assert_eq!(
+            teleprompter_line(path).as_deref(),
+            Some("teleprompter /tmp/a script.md")
+        );
+        assert_eq!(teleprompter_line(std::path::Path::new("/tmp/a\nstop")), None);
+    }
+
+    #[test]
+    fn wait_prints_the_folder_once_the_meeting_is_done() {
+        let folder = "/home/me/Documents/Meetings/202610131549 Voice-over";
+        assert_eq!(finished("done", folder, true, false), Some(folder));
+        assert_eq!(finished("transcribing", folder, true, false), None);
+        assert_eq!(finished("transcribing", folder, true, true), Some(folder));
+        // A meeting that was already done before waiting began is not the one.
+        assert_eq!(finished("done", folder, false, false), None);
+        assert_eq!(finished("done", "", true, false), None);
     }
 
     #[test]

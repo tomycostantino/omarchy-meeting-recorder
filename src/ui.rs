@@ -20,6 +20,7 @@ use crate::export::{self, Format, export_audio, export_tracks};
 use crate::ipc::{self, SharedStatus, Status};
 use crate::meeting::{self, Manifest};
 use crate::player::Player;
+use crate::teleprompter::Teleprompter;
 use crate::transcribe::{self, Abort, CANCELLED, Event, LANGUAGES};
 use crate::{APP_ID, APP_NAME, settings};
 
@@ -28,6 +29,8 @@ const SYSTEM_COLOR: (f64, f64, f64) = (0.90, 0.38, 0.0);
 const FULL_SIZE: (i32, i32) = (480, 700);
 const COMPACT_SIZE: (i32, i32) = (300, 84);
 const DONE_SIZE: (i32, i32) = (1100, 760);
+/// The recording page with the teleprompter next to it: wider, just as high.
+const PROMPTER_SIZE: (i32, i32) = (1100, FULL_SIZE.1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -135,6 +138,7 @@ impl Hub {
     fn add_window(self: &Rc<Self>, app: &adw::Application) -> Rc<Recorder> {
         let recorder = Recorder::new(app, self);
         self.windows.borrow_mut().push(recorder.clone());
+        recorder.learn_hypr_address();
         let weak = Rc::downgrade(self);
         let status = recorder.shared.clone();
         recorder.window.connect_destroy(move |_| {
@@ -200,10 +204,17 @@ impl Hub {
     }
 
     /// A command from the socket: `omarchy-meeting-recorder start` and friends.
-    /// `title` is the name that came with `start`, "" without one.
+    /// `title` is what came with it: the name for `start`, the script's path for
+    /// `teleprompter`, "" without one.
     fn command(self: &Rc<Self>, app: &adw::Application, command: &str, title: &str) {
         if command == "new-window" {
             self.add_window(app).window.present();
+            return;
+        }
+        if command == "teleprompter" {
+            let r = self.recording().unwrap_or_else(|| self.free_window(app));
+            r.open_teleprompter(std::path::Path::new(title));
+            r.window.present();
             return;
         }
         let r = match command {
@@ -352,6 +363,9 @@ struct Recorder {
     system: Source,
     shared: SharedStatus,
     hub: std::rc::Weak<Hub>,
+    /// This window's address in Hyprland, learnt once it is on screen, so a
+    /// resize reaches this window and not another one of the app.
+    hypr_address: RefCell<Option<String>>,
 
     state: Cell<State>,
     compact: Cell<bool>,
@@ -378,6 +392,10 @@ struct Recorder {
     loading: Cell<bool>,
     /// The settings of the meeting on the done page.
     manifest: RefCell<Option<Manifest>>,
+    /// The script of a voice-over, next to the recording page when one is open.
+    teleprompter: Rc<Teleprompter>,
+    /// The [a] in the corner of the recording page that opens and closes it.
+    teleprompter_button: gtk::Button,
 }
 
 impl Recorder {
@@ -411,7 +429,12 @@ impl Recorder {
         view.add_top_bar(&model_banner);
         let toasts = adw::ToastOverlay::new();
         view.set_content(Some(&toasts));
-        window.set_content(Some(&view));
+        view.set_hexpand(true);
+        let teleprompter = Teleprompter::new();
+        let panes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        panes.append(&view);
+        panes.append(&teleprompter.widget);
+        window.set_content(Some(&panes));
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -753,6 +776,16 @@ impl Recorder {
             .build();
         let overlay = gtk::Overlay::builder().child(&layout).build();
         overlay.add_overlay(&drop_hint);
+        let teleprompter_button = gtk::Button::builder()
+            .label("a")
+            .tooltip_text("Teleprompter")
+            .css_classes(["flat", "teleprompter-toggle"])
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::End)
+            .margin_end(12)
+            .margin_bottom(12)
+            .build();
+        overlay.add_overlay(&teleprompter_button);
         toasts.set_child(Some(&overlay));
 
         let compact_action = gio::SimpleAction::new("compact", None);
@@ -809,6 +842,7 @@ impl Recorder {
             system,
             shared,
             hub: Rc::downgrade(hub),
+            hypr_address: RefCell::default(),
             state: Cell::new(State::Idle),
             compact: Cell::new(false),
             full_size: Cell::new(FULL_SIZE),
@@ -830,6 +864,8 @@ impl Recorder {
             quit_when_done: Cell::new(false),
             loading: Cell::new(false),
             manifest: RefCell::default(),
+            teleprompter,
+            teleprompter_button,
         });
         recorder.connect_signals(&open_button, &new_button);
         recorder.render();
@@ -837,6 +873,24 @@ impl Recorder {
     }
 
     fn connect_signals(self: &Rc<Self>, open_button: &gtk::Button, new_button: &gtk::Button) {
+        let weak = Rc::downgrade(self);
+        self.teleprompter.close_button.connect_clicked(move |_| {
+            let Some(r) = weak.upgrade() else { return };
+            r.teleprompter.unload();
+            r.show_page();
+        });
+        let weak = Rc::downgrade(self);
+        self.teleprompter_button.connect_clicked(move |_| {
+            let Some(r) = weak.upgrade() else { return };
+            if r.teleprompter.is_loaded() {
+                r.teleprompter.unload();
+                r.show_page();
+            } else {
+                let path = r.teleprompter.last_path().unwrap_or_else(crate::teleprompter::default_script);
+                r.open_teleprompter(&path);
+            }
+        });
+
         let weak = Rc::downgrade(self);
         self.button.connect_clicked(move |_| {
             let Some(r) = weak.upgrade() else { return };
@@ -1367,6 +1421,61 @@ impl Recorder {
         }
     }
 
+    /// The meeting's folder for the bar widget and `wait`, "" before it has one.
+    fn folder_text(&self) -> String {
+        self.result_dir
+            .borrow()
+            .as_ref()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Once the window is on screen: its own Hyprland window is the one of
+    /// this process that no other window of the app has claimed yet.
+    fn learn_hypr_address(self: &Rc<Self>) {
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        self.window.connect_map(move |_| {
+            let weak = weak.clone();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                let Some(r) = weak.upgrade() else { return };
+                let Some(hub) = r.hub.upgrade() else { return };
+                let taken: Vec<String> = hub
+                    .recorders()
+                    .iter()
+                    .filter_map(|other| other.hypr_address.borrow().clone())
+                    .collect();
+                let clients = hyprctl_json("clients");
+                let unclaimed = clients.as_ref().and_then(|c| c.as_array()).and_then(|clients| {
+                    unclaimed_window(clients, std::process::id(), &taken)
+                });
+                *r.hypr_address.borrow_mut() = unclaimed;
+            });
+        });
+    }
+
+    /// Opens the script in `path` in the teleprompter on the recording page.
+    fn open_teleprompter(&self, path: &std::path::Path) {
+        if self.teleprompter.load(path) {
+            self.show_page();
+        }
+    }
+
+    /// With a script open on the recording page the teleprompter sits next to
+    /// the recorder, which keeps its own width. Returns whether it is on screen.
+    fn arrange_teleprompter(&self) -> bool {
+        let recording_page = !self.compact.get()
+            && self.layout.visible_child_name().as_deref() == Some("record");
+        let prompting = recording_page && self.teleprompter.is_loaded();
+        self.teleprompter_button.set_visible(recording_page);
+        self.teleprompter.widget.set_visible(prompting);
+        self.view.set_hexpand(!prompting);
+        self.view.set_size_request(if prompting { FULL_SIZE.0 } else { -1 }, -1);
+        prompting
+    }
+
     fn set_state(&self, state: State) {
         self.state.set(state);
         let mut shared = self.shared.lock().unwrap();
@@ -1386,6 +1495,7 @@ impl Recorder {
         if state != State::Transcribing {
             shared.progress = 0.0;
         }
+        shared.folder = self.folder_text();
         drop(shared);
         self.render();
     }
@@ -1460,8 +1570,15 @@ impl Recorder {
             _ => "record",
         };
         self.layout.set_visible_child_name(page);
+        let prompting = self.arrange_teleprompter();
         // Recording and transcribing share one size, so stopping does not jump.
-        self.fit_window(if page == "done" { DONE_SIZE } else { FULL_SIZE });
+        self.fit_window(if page == "done" {
+            DONE_SIZE
+        } else if prompting {
+            PROMPTER_SIZE
+        } else {
+            FULL_SIZE
+        });
         let immersive = matches!(state, State::Stopping | State::Transcribing);
         self.view.set_extend_content_to_top_edge(immersive);
         if immersive {
@@ -1480,14 +1597,18 @@ impl Recorder {
         }
         let minimum = if size == DONE_SIZE {
             (820, 560)
+        } else if size == PROMPTER_SIZE {
+            (900, 600)
         } else {
             (360, 200)
         };
+        let current = (self.window.width(), self.window.height());
         self.window.set_size_request(minimum.0, minimum.1);
         self.window.set_default_size(size.0, size.1);
         self.window.queue_resize();
+        let address = self.hypr_address.borrow().clone();
         glib::timeout_add_local_once(Duration::from_millis(50), move || {
-            hyprland_resize(size);
+            hyprland_resize(size, current, address);
         });
     }
 
@@ -1521,6 +1642,7 @@ impl Recorder {
                 self.full_size.set((w, h));
             }
             self.layout.set_visible_child_name("compact");
+            self.arrange_teleprompter();
             self.view.set_reveal_top_bars(false);
             // libadwaita keeps every window at least 360x200 unless told otherwise.
             self.window.set_size_request(COMPACT_SIZE.0, COMPACT_SIZE.1);
@@ -1531,12 +1653,14 @@ impl Recorder {
             self.window.set_size_request(360, 200);
             self.full_size.get()
         };
+        let current = (self.window.width(), self.window.height());
         self.window.set_default_size(size.0, size.1);
         self.window.queue_resize();
         // A compositor may ignore a client asking to change the size of a
         // window that is already on screen; on Hyprland, ask it directly.
+        let address = self.hypr_address.borrow().clone();
         glib::timeout_add_local_once(Duration::from_millis(50), move || {
-            hyprland_resize(size);
+            hyprland_resize(size, current, address);
         });
     }
 
@@ -3108,6 +3232,7 @@ impl Recorder {
             }
             self.player.relocate(&current, &target);
             *self.result_dir.borrow_mut() = Some(target.clone());
+            self.shared.lock().unwrap().folder = self.folder_text();
             self.render();
         }
         // The folder the meeting is in now: renamed, or the numbered one it had.
@@ -3310,7 +3435,9 @@ impl Paragraphs {
 
 /// Resizes this app's window through Hyprland, keeping it where it is.
 /// Does nothing outside Hyprland.
-fn hyprland_resize((width, height): (i32, i32)) {
+/// Resizes this window: the one at `address` when it is known, else the one
+/// that is `current` in size now. With more windows open, the others keep theirs.
+fn hyprland_resize((width, height): (i32, i32), current: (i32, i32), address: Option<String>) {
     if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() {
         return;
     }
@@ -3319,7 +3446,10 @@ fn hyprland_resize((width, height): (i32, i32)) {
         // Right after start the window may not be mapped yet; wait for it a little.
         let mut window = None;
         for _ in 0..30 {
-            window = own_window(pid);
+            window = match &address {
+                Some(address) => client_at(address),
+                None => own_window(pid, current),
+            };
             if window.is_some() {
                 break;
             }
@@ -3335,7 +3465,7 @@ fn hyprland_resize((width, height): (i32, i32)) {
         // Hyprland grows a floating window around its centre; a strip that was
         // dragged into a corner would then stick out. Bring it back on screen.
         std::thread::sleep(std::time::Duration::from_millis(150));
-        if let Some((x, y)) = own_window(pid).and_then(|w| on_screen(&w)) {
+        if let Some((x, y)) = client_at(&address).and_then(|w| on_screen(&w)) {
             hyprctl_dispatch(&format!(
                 "hl.dsp.window.move({{ x = {x}, y = {y}, window = \"address:{address}\" }})"
             ));
@@ -3358,12 +3488,46 @@ fn hyprctl_dispatch(call: &str) {
         .output();
 }
 
-/// This process's floating window, as `hyprctl clients -j` describes it.
-fn own_window(pid: u32) -> Option<serde_json::Value> {
+/// This process's floating window that is `size` now, as `hyprctl clients -j`
+/// describes it.
+fn own_window(pid: u32, size: (i32, i32)) -> Option<serde_json::Value> {
+    pick_window(hyprctl_json("clients")?.as_array()?, pid, size).cloned()
+}
+
+/// Of this process's floating windows, the one of `size`; with more of that
+/// size, or none (a window not on screen yet), the one focused last.
+fn pick_window(clients: &[serde_json::Value], pid: u32, size: (i32, i32)) -> Option<&serde_json::Value> {
+    let mut own: Vec<&serde_json::Value> = clients
+        .iter()
+        .filter(|c| c["pid"].as_u64() == Some(u64::from(pid)) && c["floating"] == true)
+        .collect();
+    own.sort_by_key(|c| c["focusHistoryID"].as_i64().unwrap_or(i64::MAX));
+    let sized = |c: &&&serde_json::Value| {
+        c["size"][0].as_i64() == Some(i64::from(size.0)) && c["size"][1].as_i64() == Some(i64::from(size.1))
+    };
+    own.iter().find(sized).or(own.first()).copied()
+}
+
+/// The first of this process's floating windows, most recently focused
+/// first, whose address is not in `taken`.
+fn unclaimed_window(clients: &[serde_json::Value], pid: u32, taken: &[String]) -> Option<String> {
+    let mut own: Vec<&serde_json::Value> = clients
+        .iter()
+        .filter(|c| c["pid"].as_u64() == Some(u64::from(pid)) && c["floating"] == true)
+        .collect();
+    own.sort_by_key(|c| c["focusHistoryID"].as_i64().unwrap_or(i64::MAX));
+    own.iter()
+        .filter_map(|c| c["address"].as_str())
+        .find(|address| !taken.iter().any(|t| t == address))
+        .map(str::to_owned)
+}
+
+/// A window by its Hyprland address.
+fn client_at(address: &str) -> Option<serde_json::Value> {
     hyprctl_json("clients")?
         .as_array()?
         .iter()
-        .find(|c| c["pid"].as_u64() == Some(u64::from(pid)) && c["floating"] == true)
+        .find(|c| c["address"].as_str() == Some(address))
         .cloned()
 }
 
@@ -3569,7 +3733,19 @@ fn load_css() {
          .transcript-editor { background: alpha(currentColor, 0.06); border-radius: 6px; padding: 4px 6px; }
          .transcript-editor text { background: transparent; }
          .done-icon { color: @accent_color; }
-         .player { padding: 6px 14px 6px 6px; }",
+         .player { padding: 6px 14px 6px 6px; }
+         .teleprompter { background: @window_bg_color; border-left: 1px solid alpha(currentColor, 0.1); }
+         .teleprompter-toggle { min-height: 24px; min-width: 24px; padding: 0 6px; border-radius: 6px;
+                                border: 1px solid alpha(currentColor, 0.25); font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", monospace;
+                                font-size: 13px; color: alpha(currentColor, 0.6); }
+         .teleprompter-toggle:hover { color: currentColor; }
+         .teleprompter-text { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
+                              font-size: 21px; line-height: 1.6; background: transparent; caret-color: currentColor; }
+         .teleprompter-text text { background: transparent; }
+         .teleprompter-footer { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
+                                font-size: 11px; color: alpha(currentColor, 0.5); }
+         .teleprompter-button { min-height: 26px; min-width: 26px; padding: 2px; color: alpha(currentColor, 0.5); }
+         .teleprompter-button:hover { color: currentColor; }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
@@ -3727,4 +3903,35 @@ fn meter_block(name: &str, meter: &gtk::DrawingArea) -> gtk::Box {
             .build(),
     );
     block
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_window;
+
+    #[test]
+    fn a_resize_goes_to_the_window_it_is_for() {
+        let window = |address: &str, w: i64, focus: i64| {
+            serde_json::json!({ "address": address, "pid": 7, "floating": true, "size": [w, 700], "focusHistoryID": focus })
+        };
+        let clients = vec![window("0xa", 480, 1), window("0xb", 1100, 0), window("0xc", 480, 2)];
+        let pick = |size| pick_window(&clients, 7, size).map(|c| c["address"].clone());
+        assert_eq!(pick((1100, 700)), Some("0xb".into()));
+        // Two of that size: the one focused last.
+        assert_eq!(pick((480, 700)), Some("0xa".into()));
+        // Not on screen yet: the focused one.
+        assert_eq!(pick((0, 0)), Some("0xb".into()));
+        assert_eq!(pick_window(&clients, 8, (480, 700)), None);
+    }
+
+    #[test]
+    fn a_new_window_claims_the_address_no_other_window_has() {
+        let window = |address: &str, focus: i64| {
+            serde_json::json!({ "address": address, "pid": 7, "floating": true, "focusHistoryID": focus })
+        };
+        let clients = vec![window("0xa", 1), window("0xb", 0)];
+        assert_eq!(super::unclaimed_window(&clients, 7, &[]), Some("0xb".into()));
+        assert_eq!(super::unclaimed_window(&clients, 7, &["0xb".into()]), Some("0xa".into()));
+        assert_eq!(super::unclaimed_window(&clients, 7, &["0xa".into(), "0xb".into()]), None);
+    }
 }
