@@ -377,8 +377,6 @@ struct Recorder {
     started_at: Cell<i64>,
     paused: Cell<bool>,
     frozen: [Frozen; 2],
-    /// The waves only move while recording; before that they would look like it.
-    live: Rc<Cell<bool>>,
     /// When the animation came on screen, to keep it there long enough.
     animation_since: Cell<Option<std::time::Instant>>,
     paused_secs: Cell<i64>,
@@ -485,10 +483,9 @@ impl Recorder {
         content.append(&group);
 
         let frozen: [Frozen; 2] = Default::default();
-        let live: Rc<Cell<bool>> = Rc::default();
         let meters = [
-            meter(&mic, ("blue", MIC_COLOR), 56, &frozen[0], &live),
-            meter(&system, ("orange", SYSTEM_COLOR), 56, &frozen[1], &live),
+            meter(&mic, ("blue", MIC_COLOR), 56, &frozen[0]),
+            meter(&system, ("orange", SYSTEM_COLOR), 56, &frozen[1]),
         ];
         let meters_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -717,8 +714,8 @@ impl Recorder {
 
         // Compact mode: only the two waves and the clock.
         let compact_meters = [
-            meter(&mic, ("blue", MIC_COLOR), 26, &frozen[0], &live),
-            meter(&system, ("orange", SYSTEM_COLOR), 26, &frozen[1], &live),
+            meter(&mic, ("blue", MIC_COLOR), 26, &frozen[0]),
+            meter(&system, ("orange", SYSTEM_COLOR), 26, &frozen[1]),
         ];
         let compact_dot = gtk::Label::builder()
             .label("●")
@@ -857,7 +854,6 @@ impl Recorder {
             started_at: Cell::new(0),
             paused: Cell::new(false),
             frozen,
-            live,
             animation_since: Cell::new(None),
             paused_secs: Cell::new(0),
             pause_began: Cell::new(0),
@@ -1565,7 +1561,6 @@ impl Recorder {
     fn render(&self) {
         let state = self.state.get();
         let recording = state == State::Recording;
-        self.live.set(recording);
         self.dot.set_visible(recording);
         self.compact_button.set_visible(recording);
         self.compact_action.set_enabled(recording);
@@ -3875,7 +3870,6 @@ fn meter(
     (key, fallback): (&'static str, (f64, f64, f64)),
     height: i32,
     frozen: &Frozen,
-    live: &Rc<Cell<bool>>,
 ) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::builder()
         .content_height(height)
@@ -3883,49 +3877,10 @@ fn meter(
         .build();
     let source = source.clone();
     let frozen = frozen.clone();
-    let live = live.clone();
     area.set_draw_func(move |area, cr, width, height| {
         let (r, g, b) = crate::theme::color(key, fallback);
         let (width, height) = (f64::from(width), f64::from(height));
         let paused = frozen.borrow().is_some();
-        if !live.get() && !paused {
-            // Not recording yet: no moving wave, just a line that thickens
-            // with the sound coming in, as a level check. Thick is loud.
-            let (r, g, b) = crate::theme::color(key, fallback);
-            let level = to_meter(source.recent_peak(4));
-            // The big meters keep their top strip for the caption; the line
-            // grows inside the space below it and never reaches the text.
-            let (top, bottom) = if height >= 40.0 {
-                (22.0, height - 4.0)
-            } else {
-                (2.0, height - 2.0)
-            };
-            let thickness = 1.0 + level * (bottom - top - 1.0);
-            cr.set_source_rgba(r, g, b, 0.3 + 0.6 * level);
-            cr.rectangle(0.0, (top + bottom - thickness) / 2.0, width, thickness);
-            let _ = cr.fill();
-            if height >= 40.0 {
-                let ink = area.color();
-                cr.set_source_rgba(
-                    f64::from(ink.red()),
-                    f64::from(ink.green()),
-                    f64::from(ink.blue()),
-                    0.45,
-                );
-                cr.select_font_face(
-                    "sans-serif",
-                    gtk::cairo::FontSlant::Normal,
-                    gtk::cairo::FontWeight::Normal,
-                );
-                cr.set_font_size(12.0);
-                let text = "Not recording";
-                let w = cr.text_extents(text).map(|e| e.x_advance()).unwrap_or(0.0);
-                // In the top part, clear of the line at its thickest.
-                cr.move_to((width - w) / 2.0, 15.0);
-                let _ = cr.show_text(text);
-            }
-            return;
-        }
         let levels = frozen.borrow().clone().unwrap_or_else(|| source.levels());
         let dim = if paused { 0.3 } else { 1.0 };
         let mid = height / 2.0;

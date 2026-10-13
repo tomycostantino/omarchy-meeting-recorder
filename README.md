@@ -36,7 +36,7 @@ Prefer to build it yourself? See [Build from source](#build-from-source), or gra
 
 ### Checks the sound before you start
 
-The app opens ready, not recording. The two meters are live from the start, a still line that thickens as sound comes in, so you can see that both your microphone and the computer audio arrive before the meeting begins. Type a name if you like (otherwise it becomes "Meeting 14:30"), pick the audio format and the transcript language, and press **Start recording**.
+The app opens ready, not recording. The two meters are live from the start, the same moving waves as while recording, so you can see that both your microphone and the computer audio arrive before the meeting begins. Type a name if you like (otherwise it becomes "Meeting 14:30"), pick the audio format and the transcript language, and press **Start recording**.
 
 <p align="center"><img src="screenshots/ready.webp" alt="The ready page: meeting name, audio file, language, two meters that say Not recording, the Start recording button and Import an audio file, or drop one here" width="440"></p>
 
