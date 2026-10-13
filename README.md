@@ -50,7 +50,7 @@ Your microphone and whatever your computer plays are recorded as two separate tr
 
 ### Records your webcam too, if you like
 
-Turn on **Webcam** on the ready page and your camera is recorded next to the audio, as `webcam.mp4` in the meeting folder; pauses are left out, as in the audio. The video carries your microphone as well, so an editor can line it up with the audio tracks exactly: the camera always starts a moment after the audio. The toggle is remembered, and so is the camera, which is the first real one the system has.
+Turn on **Webcam** and your camera is recorded next to the audio, as `webcam.mp4` (picture only) in the meeting folder, and a small live picture in its row shows what it sees. The video keeps time with the audio: with the camera on, a recording (or a resume) starts its audio once the first frame is in, pauses are left out as in the audio, and you can turn the camera on or off during the recording, black filling the time it was off. The toggle is remembered, and so is the camera, which is the first real one the system has.
 
 ### Keeps your notes next to the recording
 
@@ -149,7 +149,7 @@ Inside, the audio in the format you picked, the transcript, a `.meeting-recorder
   - **Separate files**: `mic.ogg` and `computer.ogg`
 - `.tracks/mic.ogg` and `.tracks/computer.ogg`, a hidden copy of both tracks in mono. This is what Transcribe again uses, so the speakers stay apart whatever audio format you chose. Delete the directory if you do not need that.
 - `notes.md`, the notes that were open while you recorded, when there were any
-- `webcam.mp4`, the camera with your microphone, when a webcam was picked
+- `webcam.mp4`, the camera, picture only and as long as the audio, when the webcam was on
 - For an imported file: `audio.ogg`, the transcript and the `.meeting-recorder` file; the original file is left where it was.
 
 Both tracks are always recorded separately, and each is levelled to the same speech loudness when it is saved, so a quiet microphone and a loud call end up equally easy to hear. The format can be switched until the moment you press stop.

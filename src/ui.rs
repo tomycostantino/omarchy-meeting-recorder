@@ -322,6 +322,8 @@ struct Recorder {
     /// The camera the toggle records, when there is one.
     webcam_camera: Option<(PathBuf, String)>,
     webcam: crate::webcam::Webcam,
+    /// Waiting for the camera's first frame before the audio starts or resumes.
+    starting: Cell<bool>,
     /// What the camera sees, in the webcam row, before and while recording.
     webcam_preview: gtk::Picture,
     animation: TranscribeAnimation,
@@ -848,6 +850,7 @@ impl Recorder {
             webcam_row,
             webcam_camera,
             webcam: crate::webcam::Webcam::new(frames_tx),
+            starting: Cell::new(false),
             webcam_preview,
             animation,
             meters,
@@ -1082,6 +1085,17 @@ impl Recorder {
                 settings::save_webcam_on(row.is_active());
                 if let Some((_, name)) = &r.webcam_camera {
                     settings::save_webcam(name);
+                }
+                // During a recording the camera joins or leaves; black fills where it was off.
+                if r.state.get() == State::Recording {
+                    let device = r.selected_webcam().map(|(device, _)| device);
+                    r.webcam.switch(device.as_deref());
+                    if device.is_some() && !r.paused.get() {
+                        let this = r.clone();
+                        glib::spawn_future_local(async move {
+                            this.webcam.first_frame(Duration::from_secs(5)).await;
+                        });
+                    }
                 }
                 r.update_preview();
             }
@@ -1639,7 +1653,8 @@ impl Recorder {
         let state = self.state.get();
         let recording = state == State::Recording;
         self.webcam_row.set_sensitive(
-            self.webcam_camera.is_some() && matches!(state, State::Idle | State::Done),
+            self.webcam_camera.is_some()
+                && matches!(state, State::Idle | State::Done | State::Recording),
         );
         self.dot.set_visible(recording);
         self.compact_button.set_visible(recording);
@@ -1812,25 +1827,41 @@ impl Recorder {
         (until - self.started_at.get() - self.paused_secs.get()).max(0)
     }
 
-    fn toggle_pause(&self) {
-        if self.state.get() != State::Recording {
+    fn toggle_pause(self: &Rc<Self>) {
+        if self.state.get() != State::Recording || self.starting.get() {
             return;
         }
-        if self.paused.get() {
-            self.paused_secs
-                .set(self.paused_secs.get() + ipc::now() - self.pause_began.get());
-            self.paused.set(false);
-        } else {
+        if !self.paused.get() {
+            self.webcam.audio_paused();
             self.pause_began.set(ipc::now());
             self.paused.set(true);
+            self.mic.set_paused(true);
+            self.system.set_paused(true);
+            self.after_pause_change();
+            return;
         }
-        self.mic.set_paused(self.paused.get());
-        self.system.set_paused(self.paused.get());
-        if self.paused.get() {
-            self.webcam.pause();
-        } else {
-            self.webcam.resume();
-        }
+        // Resuming: with the camera on, the audio waits for its first frame again.
+        self.webcam.resume();
+        self.starting.set(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            this.webcam.first_frame(Duration::from_secs(3)).await;
+            this.starting.set(false);
+            // Stopped while the camera came back: nothing to resume.
+            if this.state.get() != State::Recording || !this.paused.get() {
+                return;
+            }
+            this.paused_secs
+                .set(this.paused_secs.get() + ipc::now() - this.pause_began.get());
+            this.paused.set(false);
+            this.mic.set_paused(false);
+            this.system.set_paused(false);
+            this.webcam.audio_started();
+            this.after_pause_change();
+        });
+    }
+
+    fn after_pause_change(&self) {
         self.update_preview();
         self.freeze_meters(self.paused.get());
         self.set_state(State::Recording);
@@ -2177,6 +2208,9 @@ impl Recorder {
             self.toast("Another window is recording");
             return;
         }
+        if self.starting.get() {
+            return;
+        }
         // A name typed before starting is kept; otherwise one from the time.
         if self.title_row.text().trim().is_empty() {
             let title = glib::DateTime::now_local()
@@ -2188,20 +2222,48 @@ impl Recorder {
         self.paused.set(false);
         self.paused_secs.set(0);
         self.pause_began.set(0);
-        let started_at = ipc::now();
         let staging = glib::user_cache_dir()
             .join(APP_NAME)
-            .join(started_at.to_string());
-        if let Err(e) = std::fs::create_dir_all(&staging)
-            .and_then(|_| self.mic.start_recording(&staging.join("mic.raw")))
-            .and_then(|_| self.system.start_recording(&staging.join("system.raw")))
-        {
-            self.mic.stop_recording();
-            self.system.stop_recording();
+            .join(ipc::now().to_string());
+        if let Err(e) = std::fs::create_dir_all(&staging) {
             self.status_label
                 .set_label(&format!("Could not start recording: {e}"));
             return;
         }
+        let camera = self.selected_webcam().map(|(device, _)| device);
+        self.webcam.begin(&staging, camera.as_deref());
+        if camera.is_none() {
+            self.start_audio(staging);
+            return;
+        }
+        // The audio waits for the camera's first frame, so the two start together.
+        self.starting.set(true);
+        self.button.set_sensitive(false);
+        self.status_label.set_label("Starting the camera…");
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            this.webcam.first_frame(Duration::from_secs(3)).await;
+            this.starting.set(false);
+            this.button.set_sensitive(true);
+            this.start_audio(staging);
+        });
+    }
+
+    fn start_audio(self: &Rc<Self>, staging: PathBuf) {
+        let started_at = ipc::now();
+        if let Err(e) = self
+            .mic
+            .start_recording(&staging.join("mic.raw"))
+            .and_then(|_| self.system.start_recording(&staging.join("system.raw")))
+        {
+            self.mic.stop_recording();
+            self.system.stop_recording();
+            let _ = self.webcam.end();
+            self.status_label
+                .set_label(&format!("Could not start recording: {e}"));
+            return;
+        }
+        self.webcam.audio_started();
         write_recording_note(
             &staging,
             &self.title(),
@@ -2209,9 +2271,6 @@ impl Recorder {
             self.selected_format(),
             self.selected_language(),
         );
-        if let Some((device, _)) = self.selected_webcam() {
-            self.webcam.start(&device, &staging);
-        }
         *self.staging.borrow_mut() = Some(staging);
         *self.result_dir.borrow_mut() = None;
         self.player.unload();
@@ -2234,7 +2293,7 @@ impl Recorder {
         self.animation_since.set(Some(std::time::Instant::now()));
         self.mic.stop_recording();
         self.system.stop_recording();
-        let webcam = self.webcam.stop();
+        let webcam = self.webcam.end();
         let Some(staging) = self.staging.borrow().clone() else {
             return;
         };

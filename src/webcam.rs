@@ -1,10 +1,12 @@
-//! The webcam, recorded next to the audio when one is picked.
+//! The webcam, recorded next to the audio while its toggle is on.
 //!
-//! ffmpeg takes the camera and the microphone, one segment for every stretch
-//! between pauses, and the segments become `webcam.mp4` in the meeting
-//! folder when it is saved. The microphone in the video is there so an
-//! editor can line the picture up with the audio tracks exactly: the camera
-//! always starts a moment after the audio.
+//! ffmpeg takes the camera, picture only, one part for every stretch it runs:
+//! a pause ends a part, and so does turning the toggle off. Each part knows
+//! where it sits on the audio's clock, the recorded time without the pauses,
+//! so `webcam.mp4` keeps time with the audio. A recording, or a resume, with
+//! the camera on starts its audio once the first frame is in, so the parts
+//! join up and are copied as they are; where the camera was off, or was
+//! still starting, black fills the gap and the video is encoded once more.
 
 use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
@@ -81,10 +83,15 @@ fn take_jpeg(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
 
 /// Hands the frames a process writes to the preview, until its stdout closes.
 /// Frames the window has no time for are dropped.
-fn read_frames(child: &mut Child, frames: &async_channel::Sender<Vec<u8>>) {
+fn read_frames(
+    child: &mut Child,
+    frames: &async_channel::Sender<Vec<u8>>,
+    first: Option<async_channel::Sender<()>>,
+) {
     let Some(mut stdout) = child.stdout.take() else { return };
     let frames = frames.clone();
     std::thread::spawn(move || {
+        let mut first = first;
         let mut buffer = Vec::new();
         let mut chunk = [0u8; 65536];
         loop {
@@ -94,22 +101,46 @@ fn read_frames(child: &mut Child, frames: &async_channel::Sender<Vec<u8>>) {
             };
             buffer.extend_from_slice(&chunk[..read]);
             while let Some(frame) = take_jpeg(&mut buffer) {
+                if let Some(first) = first.take() {
+                    let _ = first.try_send(());
+                }
                 let _ = frames.try_send(frame);
             }
         }
     });
 }
 
+/// One run of the camera during a recording.
+struct Part {
+    file: PathBuf,
+    /// Where the first and the last frame sit on the audio's clock.
+    start: Option<f64>,
+    end: Option<f64>,
+}
+
+/// What `export` makes `webcam.mp4` from, handed over when a recording stops.
+pub struct Plan {
+    closing: Vec<Child>,
+    parts: Vec<(PathBuf, f64, f64)>,
+    total: f64,
+}
+
 pub struct Webcam {
+    /// The camera while its toggle is on during a recording.
     device: RefCell<Option<PathBuf>>,
     staging: RefCell<Option<PathBuf>>,
     running: RefCell<Option<Child>>,
-    /// Segments told to stop that may still be writing their last frames.
+    /// Parts told to stop that may still be writing their last frames.
     ending: RefCell<Vec<Child>>,
-    segments: Cell<u32>,
+    parts: RefCell<Vec<Part>>,
+    /// The audio's clock: the stretches done, and when the running one began.
+    recorded: Cell<f64>,
+    stretch_began: Cell<Option<Instant>>,
     /// The camera shown, before a recording starts.
     previewing: RefCell<Option<Child>>,
     frames: async_channel::Sender<Vec<u8>>,
+    /// Hears when the running part sends its first frame.
+    first_frame: RefCell<Option<async_channel::Receiver<()>>>,
 }
 
 impl Webcam {
@@ -120,9 +151,12 @@ impl Webcam {
             staging: RefCell::default(),
             running: RefCell::default(),
             ending: RefCell::default(),
-            segments: Cell::new(0),
+            parts: RefCell::default(),
+            recorded: Cell::new(0.0),
+            stretch_began: Cell::new(None),
             previewing: RefCell::default(),
             frames,
+            first_frame: RefCell::default(),
         }
     }
 
@@ -139,7 +173,7 @@ impl Webcam {
         command.args(["-f", "v4l2", "-i"]).arg(device).args(PREVIEW).stdin(Stdio::null());
         match command.spawn() {
             Ok(mut child) => {
-                read_frames(&mut child, &self.frames);
+                read_frames(&mut child, &self.frames, None);
                 *self.previewing.borrow_mut() = Some(child);
             }
             Err(err) => eprintln!("{APP_NAME}: could not show the webcam: {err}"),
@@ -154,47 +188,124 @@ impl Webcam {
         }
     }
 
-    /// Starts recording `device` into the staging folder of a new recording.
-    pub fn start(&self, device: &Path, staging: &Path) {
-        *self.device.borrow_mut() = Some(device.to_owned());
-        *self.staging.borrow_mut() = Some(staging.to_owned());
-        self.segments.set(0);
-        self.resume();
+    /// Where the audio is now: the recorded time, without the pauses.
+    fn clock(&self) -> f64 {
+        self.recorded.get() + self.stretch_began.get().map_or(0.0, |began| began.elapsed().as_secs_f64())
     }
 
-    /// Starts the next segment, after a pause or at the start. The same
-    /// ffmpeg feeds the preview.
-    pub fn resume(&self) {
+    /// A recording begins in `staging`, with the camera when `device` is given.
+    /// The audio has not started yet; see `audio_started`.
+    pub fn begin(&self, staging: &Path, device: Option<&Path>) {
+        *self.staging.borrow_mut() = Some(staging.to_owned());
+        self.parts.borrow_mut().clear();
+        self.recorded.set(0.0);
+        self.stretch_began.set(None);
+        *self.device.borrow_mut() = device.map(Path::to_owned);
+        self.start_part();
+    }
+
+    /// Starts a part when the camera is wanted and none runs; the same ffmpeg
+    /// feeds the preview.
+    fn start_part(&self) {
         let (Some(device), Some(staging)) = (self.device.borrow().clone(), self.staging.borrow().clone())
         else {
             return;
         };
+        if self.running.borrow().is_some() {
+            return;
+        }
         self.stop_preview();
-        let n = self.segments.get();
-        self.segments.set(n + 1);
+        let file = segment(&staging, self.parts.borrow().len() as u32);
         let mut command = ffmpeg();
         command
             .args(["-thread_queue_size", "512", "-f", "v4l2", "-i"])
             .arg(&device)
-            .args(["-thread_queue_size", "512", "-f", "pulse", "-i", "default"])
-            .args(["-map", "0:v", "-map", "1:a"])
-            .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"])
-            .args(["-c:a", "aac", "-b:a", "160k", "-y"])
-            .arg(segment(&staging, n))
+            .args(["-map", "0:v"])
+            .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-y"])
+            .arg(&file)
             .args(["-map", "0:v"])
             .args(PREVIEW)
             .stdin(Stdio::piped());
         match command.spawn() {
             Ok(mut child) => {
-                read_frames(&mut child, &self.frames);
+                let (first, heard) = async_channel::bounded(1);
+                read_frames(&mut child, &self.frames, Some(first));
+                *self.first_frame.borrow_mut() = Some(heard);
                 *self.running.borrow_mut() = Some(child);
+                self.parts.borrow_mut().push(Part { file, start: None, end: None });
             }
             Err(err) => eprintln!("{APP_NAME}: could not start the webcam: {err}"),
         }
     }
 
-    /// Ends the running segment: ffmpeg closes the file once it reads q.
-    pub fn pause(&self) {
+    /// Waits for the first frame of the part just started, at most `limit`;
+    /// at once when none is starting.
+    pub async fn first_frame(&self, limit: Duration) {
+        let Some(heard) = self.first_frame.borrow_mut().take() else {
+            return;
+        };
+        let _ = gtk::glib::future_with_timeout(limit, heard.recv()).await;
+        self.mark_start();
+    }
+
+    /// The running part begins here on the audio's clock, if the audio runs.
+    fn mark_start(&self) {
+        if self.stretch_began.get().is_none() {
+            return;
+        }
+        let clock = self.clock();
+        if let Some(part) = self.parts.borrow_mut().last_mut()
+            && part.start.is_none()
+            && part.end.is_none()
+        {
+            part.start = Some(clock);
+        }
+    }
+
+    /// The audio starts or resumes now.
+    pub fn audio_started(&self) {
+        self.stretch_began.set(Some(Instant::now()));
+        // A part whose first frame is already in begins with the audio.
+        if self.first_frame.borrow().is_none() {
+            self.mark_start();
+        }
+    }
+
+    /// The audio pauses: the running part ends where the audio stops.
+    pub fn audio_paused(&self) {
+        self.end_part();
+        self.recorded.set(self.clock());
+        self.stretch_began.set(None);
+    }
+
+    /// Resuming: the camera comes back first, when it is wanted, so the audio
+    /// can wait for its first frame.
+    pub fn resume(&self) {
+        self.start_part();
+    }
+
+    /// The toggle, during a recording: on starts a part (the gap before its
+    /// first frame becomes black), off ends the running one.
+    pub fn switch(&self, device: Option<&Path>) {
+        *self.device.borrow_mut() = device.map(Path::to_owned);
+        if device.is_some() {
+            if self.stretch_began.get().is_some() {
+                self.start_part();
+            }
+        } else {
+            self.end_part();
+        }
+    }
+
+    /// Ends the running part on the audio's clock: ffmpeg closes the file once it reads q.
+    fn end_part(&self) {
+        let clock = self.clock();
+        if let Some(part) = self.parts.borrow_mut().last_mut()
+            && part.end.is_none()
+        {
+            part.end = Some(clock);
+        }
+        *self.first_frame.borrow_mut() = None;
         if let Some(mut child) = self.running.borrow_mut().take() {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(b"q");
@@ -203,11 +314,24 @@ impl Webcam {
         }
     }
 
-    /// Ends the recording; the segments that may still be closing go to `export`.
-    pub fn stop(&self) -> Vec<Child> {
-        self.pause();
+    /// Ends the recording, and hands over what `export` needs.
+    pub fn end(&self) -> Plan {
+        self.end_part();
+        let total = self.clock();
+        self.stretch_began.set(None);
         *self.device.borrow_mut() = None;
-        std::mem::take(&mut *self.ending.borrow_mut())
+        let parts = self
+            .parts
+            .take()
+            .into_iter()
+            .filter_map(|part| Some((part.file, part.start?, part.end?)))
+            .filter(|(_, start, end)| end > start)
+            .collect();
+        Plan {
+            closing: self.ending.take(),
+            parts,
+            total,
+        }
     }
 }
 
@@ -222,10 +346,65 @@ impl Drop for Webcam {
     }
 }
 
-/// Waits for the last segments to close and joins all of them into
-/// `webcam.mp4` in `out`. Blocking. False when there was nothing to join.
-pub fn export(staging: &Path, out: &Path, closing: Vec<Child>) -> bool {
-    for mut child in closing {
+/// How far a part may sit from the next one and still count as joined up.
+const SLACK: f64 = 0.1;
+
+/// Whether the parts cover the whole audio without gaps.
+fn joined_up(parts: &[(PathBuf, f64, f64)], total: f64) -> bool {
+    let Some(first) = parts.first() else { return false };
+    let last = &parts[parts.len() - 1];
+    first.1 <= SLACK
+        && parts.windows(2).all(|pair| pair[1].1 - pair[0].2 <= SLACK)
+        && total - last.2 <= SLACK
+}
+
+/// The ffmpeg concat list for parts that join up: each up to its length.
+fn concat_list(parts: &[(PathBuf, f64, f64)]) -> String {
+    parts
+        .iter()
+        .map(|(path, start, end)| {
+            let path = path.display().to_string().replace('\'', "'\\''");
+            format!("file '{path}'\noutpoint {:.3}\n", end - start)
+        })
+        .collect()
+}
+
+/// The filter that lays the parts on the audio's clock, black in between.
+/// Input n is the nth part.
+fn padded_filter(parts: &[(PathBuf, f64, f64)], total: f64) -> String {
+    const SIZE: &str = "1920x1080";
+    let mut steps = Vec::new();
+    let mut pieces = Vec::new();
+    let mut at = 0.0;
+    fn black(length: f64, steps: &mut Vec<String>, pieces: &mut Vec<String>) {
+        let label = format!("b{}", pieces.len());
+        steps.push(format!("color=c=black:s={SIZE}:r=30:d={length:.3}[{label}]"));
+        pieces.push(label);
+    }
+    for (n, (_, start, end)) in parts.iter().enumerate() {
+        if start - at > 0.04 {
+            black(start - at, &mut steps, &mut pieces);
+        }
+        let label = format!("p{n}");
+        steps.push(format!(
+            "[{n}:v]trim=duration={:.3},setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p,setsar=1[{label}]",
+            end - start
+        ));
+        pieces.push(label);
+        at = *end;
+    }
+    if total - at > 0.04 {
+        black(total - at, &mut steps, &mut pieces);
+    }
+    let inputs: String = pieces.iter().map(|label| format!("[{label}]")).collect();
+    steps.push(format!("{inputs}concat=n={}:v=1:a=0[v]", pieces.len()));
+    steps.join(";")
+}
+
+/// Waits for the last parts to close and makes `webcam.mp4` in `out`, as long
+/// as the audio. Blocking. False when the camera recorded nothing.
+pub fn export(staging: &Path, out: &Path, plan: Plan) -> bool {
+    for mut child in plan.closing {
         let deadline = Instant::now() + Duration::from_secs(10);
         while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
@@ -233,28 +412,36 @@ pub fn export(staging: &Path, out: &Path, closing: Vec<Child>) -> bool {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let parts: Vec<PathBuf> = (0..)
-        .map(|n| segment(staging, n))
-        .take_while(|path| path.exists())
-        .filter(|path| std::fs::metadata(path).is_ok_and(|m| m.len() > 0))
+    let parts: Vec<(PathBuf, f64, f64)> = plan
+        .parts
+        .into_iter()
+        .filter(|(path, _, _)| std::fs::metadata(path).is_ok_and(|m| m.len() > 0))
         .collect();
     if parts.is_empty() {
         return false;
     }
-    let list = staging.join("webcam.txt");
-    let lines: String = parts
-        .iter()
-        .map(|path| format!("file '{}'\n", path.display().to_string().replace('\'', "'\\''")))
-        .collect();
-    if std::fs::write(&list, lines).is_err() {
-        return false;
+    let mut command = Command::new("ffmpeg");
+    command.args(["-hide_banner", "-loglevel", "error", "-y"]).stdin(Stdio::null());
+    if joined_up(&parts, plan.total) {
+        let list = staging.join("webcam.txt");
+        if std::fs::write(&list, concat_list(&parts)).is_err() {
+            return false;
+        }
+        command
+            .args(["-f", "concat", "-safe", "0", "-i"])
+            .arg(&list)
+            .args(["-c", "copy"]);
+    } else {
+        for (path, _, _) in &parts {
+            command.arg("-i").arg(path);
+        }
+        command
+            .args(["-filter_complex", &padded_filter(&parts, plan.total), "-map", "[v]"])
+            .args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]);
     }
-    Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i"])
-        .arg(&list)
-        .args(["-c", "copy", "-movflags", "+faststart", "-y"])
+    command
+        .args(["-movflags", "+faststart"])
         .arg(out.join(FILE))
-        .stdin(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
 }
@@ -283,6 +470,30 @@ mod tests {
         // The next frame is not whole yet: it waits for more of the stream.
         assert_eq!(take_jpeg(&mut stream), None);
         assert_eq!(stream, vec![0xFF, 0xD8, 3]);
+    }
+
+    fn part(n: u32, start: f64, end: f64) -> (PathBuf, f64, f64) {
+        (segment(Path::new("/tmp/rec"), n), start, end)
+    }
+
+    #[test]
+    fn parts_that_join_up_are_copied_each_up_to_its_length() {
+        let parts = [part(0, 0.0, 4.25), part(1, 4.3, 6.8)];
+        assert!(joined_up(&parts, 6.85));
+        assert_eq!(
+            concat_list(&parts),
+            "file '/tmp/rec/webcam-000.mkv'\noutpoint 4.250\nfile '/tmp/rec/webcam-001.mkv'\noutpoint 2.500\n"
+        );
+    }
+
+    #[test]
+    fn a_camera_turned_on_later_or_off_early_is_padded_with_black() {
+        // On after 2 s, off at 5 s, of 8 s of audio.
+        let parts = [part(0, 2.0, 5.0)];
+        assert!(!joined_up(&parts, 8.0));
+        let filter = padded_filter(&parts, 8.0);
+        assert!(filter.starts_with("color=c=black:s=1920x1080:r=30:d=2.000[b0];[0:v]trim=duration=3.000"));
+        assert!(filter.ends_with("color=c=black:s=1920x1080:r=30:d=3.000[b2];[b0][p0][b2]concat=n=3:v=1:a=0[v]"));
     }
 
     #[test]
