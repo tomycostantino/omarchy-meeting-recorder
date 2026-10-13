@@ -84,8 +84,10 @@ pub fn now() -> i64 {
 }
 
 /// Commands a client may send, one per line. `start` may be followed by a
-/// space and the meeting's name, `notes` by the path of a notes file.
-pub const COMMANDS: [&str; 6] = [
+/// space and the meeting's name, `notes` by the path of a notes file, and
+/// `name` by a name for the meeting about to be recorded.
+pub const COMMANDS: [&str; 7] = [
+    "name",
     "start",
     "stop",
     "compact",
@@ -199,6 +201,7 @@ fn parse_command(line: &str) -> Option<Command> {
     let (name, title) = match line.split_once(' ') {
         Some(("start", title)) => ("start", title.trim()),
         Some(("notes", path)) => ("notes", path.trim()),
+        Some(("name", title)) => ("name", title.trim()),
         _ => (line, ""),
     };
     COMMANDS
@@ -220,6 +223,17 @@ pub fn start_line(title: &[String]) -> String {
     } else {
         format!("start {title}")
     }
+}
+
+/// `notes <file> --name <name>`: the line that names the meeting about to be
+/// recorded, without starting it. None without a name.
+pub fn name_line(title: &[String]) -> Option<String> {
+    let title = title
+        .iter()
+        .flat_map(|word| word.split_whitespace())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!title.is_empty()).then(|| format!("name {title}"))
 }
 
 /// `omarchy-meeting-recorder notes <file>`: the line that opens those notes.
@@ -345,6 +359,17 @@ mod tests {
         // Only start takes a name.
         assert_eq!(parse_command("stop now\n"), None);
         assert_eq!(parse_command("starting\n"), None);
+    }
+
+    #[test]
+    fn notes_can_name_the_meeting() {
+        let args = ["Voice-over\nstop".to_owned(), " prioriteit ".to_owned()];
+        assert_eq!(name_line(&args).as_deref(), Some("name Voice-over stop prioriteit"));
+        assert_eq!(name_line(&[]), None);
+        assert_eq!(
+            parse_command("name Voice-over prioriteit\n"),
+            Some(("name", "Voice-over prioriteit".into()))
+        );
     }
 
     #[test]

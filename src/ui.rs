@@ -215,9 +215,18 @@ impl Hub {
             self.add_window(app).window.present();
             return;
         }
-        if command == "notes" {
+        if command == "notes" || command == "name" {
             let r = self.recording().unwrap_or_else(|| self.free_window(app));
-            r.open_notes(std::path::Path::new(title));
+            // Notes are for reading while recording: a window showing a meeting
+            // goes back to the recording page first.
+            if r.state.get() == State::Done {
+                r.ready();
+            }
+            if command == "notes" {
+                r.open_notes(std::path::Path::new(title));
+            } else if r.state.get() == State::Idle {
+                r.title_row.set_text(title);
+            }
             r.window.present();
             return;
         }

@@ -27,15 +27,33 @@ use gtk::glib;
 pub const APP_ID: &str = "com.jankeesvw.OmarchyMeetingRecorder";
 pub const APP_NAME: &str = "omarchy-meeting-recorder";
 
-/// Sends `line` to the running app, or opens the app and sends it as soon as it listens.
-fn send_or_open(line: String) -> glib::ExitCode {
-    if ipc::send(&line) {
+/// The meeting's name in `start`'s arguments: what follows `--name`, or for
+/// older scripts the arguments themselves.
+fn name_argument(args: &[String]) -> Vec<String> {
+    match args.iter().position(|arg| arg == "--name") {
+        Some(at) => args[at + 1..].to_vec(),
+        None => args.to_vec(),
+    }
+}
+
+/// Sends `lines` to the running app, or opens the app and sends them as soon as it listens.
+fn send_or_open(lines: Vec<String>) -> glib::ExitCode {
+    let Some(first) = lines.first().cloned() else {
+        return glib::ExitCode::SUCCESS;
+    };
+    if ipc::send(&first) {
+        lines[1..].iter().for_each(|line| {
+            ipc::send(line);
+        });
         return glib::ExitCode::SUCCESS;
     }
     std::thread::spawn(move || {
         for _ in 0..100 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            if ipc::send(&line) {
+            if ipc::send(&first) {
+                lines[1..].iter().for_each(|line| {
+                    ipc::send(line);
+                });
                 return;
             }
         }
@@ -59,9 +77,9 @@ fn main() -> glib::ExitCode {
             ipc::watch();
             glib::ExitCode::SUCCESS
         }
-        Some("start") => {
-            send_or_open(ipc::start_line(&std::env::args().skip(2).collect::<Vec<_>>()))
-        }
+        Some("start") => send_or_open(vec![ipc::start_line(&name_argument(
+            &std::env::args().skip(2).collect::<Vec<_>>(),
+        ))]),
         Some(command @ ("stop" | "compact" | "pause")) => {
             if ipc::send(command) {
                 glib::ExitCode::SUCCESS
@@ -80,12 +98,17 @@ fn main() -> glib::ExitCode {
         }
         // Only from the command line: there is no button for it in the app.
         Some("notes") => {
-            let line = std::env::args()
-                .nth(2)
+            // notes <file> [--name <name>]: the name goes to the meeting about to be recorded.
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let (file, name) = match args.iter().position(|arg| arg == "--name") {
+                Some(at) => (args[..at].first().cloned(), args[at + 1..].to_vec()),
+                None => (args.first().cloned(), Vec::new()),
+            };
+            let line = file
                 .and_then(|path| std::fs::canonicalize(path).ok())
                 .and_then(|path| ipc::notes_line(&path));
             match line {
-                Some(line) => send_or_open(line),
+                Some(line) => send_or_open([Some(line), ipc::name_line(&name)].into_iter().flatten().collect()),
                 None => {
                     eprintln!("{APP_NAME}: notes needs a text file that exists");
                     glib::ExitCode::from(2)
@@ -109,12 +132,12 @@ fn main() -> glib::ExitCode {
         Some("ask") => agent::cli(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("-h" | "--help") => {
             println!(
-                "Usage: {APP_NAME} [start [name] | stop | pause | compact | watch | wait [--audio] | notes <file> | transcribe <mic> <computer> [--language xx]]"
+                "Usage: {APP_NAME} [start [--name <name>] | stop | pause | compact | watch | wait [--audio] | notes <file> [--name <name>] | transcribe <mic> <computer> [--language xx]]"
             );
             println!();
             println!("  (no command)  open the recorder, ready to record");
             println!("  <meeting>     open a .meeting-recorder file or a meeting folder");
-            println!("  start [name]  start recording, opening the recorder if needed");
+            println!("  start [--name <name>]  start recording, opening the recorder if needed");
             println!("  stop          stop the running recording (for a keybinding)");
             println!("  compact       switch the recording window between full and compact");
             println!("  pause         pause or resume the running recording");
@@ -123,7 +146,7 @@ fn main() -> glib::ExitCode {
                 "  wait          wait until the recording is done and print its folder (--audio: once the audio is saved)"
             );
             println!(
-                "  notes <file>  show notes next to the recorder, to read from and edit while recording"
+                "  notes <file> [--name <name>]  show notes next to the recorder, to read from and edit while recording, and name the meeting about to be recorded"
             );
             println!("  transcribe    transcribe two tracks and print the transcript as Markdown");
             println!(
@@ -145,5 +168,18 @@ fn main() -> glib::ExitCode {
             eprintln!("{APP_NAME}: unknown command '{other}', see --help");
             glib::ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_argument;
+
+    #[test]
+    fn start_takes_its_name_after_the_flag_or_as_before() {
+        let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(name_argument(&args(&["--name", "Voice-over", "prioriteit"])), args(&["Voice-over", "prioriteit"]));
+        assert_eq!(name_argument(&args(&["Weekly", "sync"])), args(&["Weekly", "sync"]));
+        assert!(name_argument(&[]).is_empty());
     }
 }

@@ -269,14 +269,14 @@ This also recovers a failed first-start “Add to Bar” attempt in version 1.0.
 |---|---|
 | `omarchy-meeting-recorder` | Open the recorder, ready to record |
 | `omarchy-meeting-recorder <folder or .meeting-recorder file>` | Open a saved meeting on the done page |
-| `omarchy-meeting-recorder start [name]` | Start recording, for a keybinding; opens the recorder first when it is not running. With a name, the meeting gets that name (a script can pass a calendar event's title) |
+| `omarchy-meeting-recorder start [--name <name>]` | Start recording, for a keybinding; opens the recorder first when it is not running. With a name, the meeting gets that name (a script can pass a calendar event's title); the name without `--name` works too |
 | `omarchy-meeting-recorder pause` | Pause or resume the running recording |
 | `omarchy-meeting-recorder stop` | Stop the running recording |
 | `omarchy-meeting-recorder compact` | Switch the recording window between full and compact |
 | `omarchy-meeting-recorder new-window` | Open another window, or the app when it is not running |
 | `omarchy-meeting-recorder watch` | Stream the recorder state as NDJSON, for the bar widget; a line carries the meeting's `folder` once it has one |
 | `omarchy-meeting-recorder wait [--audio]` | Wait until the meeting being recorded is done and print its folder, for a script or an agent; with `--audio` as soon as the audio is saved, before the transcript |
-| `omarchy-meeting-recorder notes <file>` | Show a file as notes next to the recorder, to read from and edit while recording |
+| `omarchy-meeting-recorder notes <file> [--name <name>]` | Show a file as notes next to the recorder, to read from and edit while recording; with a name, the meeting about to be recorded gets it, whoever presses Start |
 | `omarchy-meeting-recorder transcribe <mic> <computer> [--language xx] [--model name]` | Transcribe two tracks and print the transcript as Markdown |
 | `omarchy-meeting-recorder transcribe-file <audio> [--speakers N] [--language xx] [--model name]` | Transcribe one file, telling the voices apart, and print the transcript as Markdown |
 | `omarchy-meeting-recorder ask "<prompt>" < text` | Run a prompt over stdin through the default agent, without tools (`ask --agent` shows which agent that is) |
