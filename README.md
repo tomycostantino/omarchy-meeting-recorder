@@ -50,7 +50,7 @@ Your microphone and whatever your computer plays are recorded as two separate tr
 
 ### Records your webcam too, if you like
 
-Pick a camera under **Webcam** on the ready page and it is recorded next to the audio, as `webcam.mp4` in the meeting folder; pauses are left out, as in the audio. The video carries your microphone as well, so an editor can line it up with the audio tracks exactly: the camera always starts a moment after the audio. The choice is remembered; **Off** records sound only.
+Turn on **Webcam** on the ready page and your camera is recorded next to the audio, as `webcam.mp4` in the meeting folder; pauses are left out, as in the audio. The video carries your microphone as well, so an editor can line it up with the audio tracks exactly: the camera always starts a moment after the audio. The toggle is remembered, and so is the camera, which is the first real one the system has.
 
 ### Keeps your notes next to the recording
 

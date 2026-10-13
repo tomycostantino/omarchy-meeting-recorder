@@ -317,10 +317,13 @@ struct Recorder {
     title_row: adw::EntryRow,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
-    /// Off, or the camera to record next to the audio.
-    webcam_row: adw::ComboRow,
-    webcam_devices: Vec<(PathBuf, String)>,
+    /// Whether to record the camera next to the audio.
+    webcam_row: adw::SwitchRow,
+    /// The camera the toggle records, when there is one.
+    webcam_camera: Option<(PathBuf, String)>,
     webcam: crate::webcam::Webcam,
+    /// What the camera sees, in the webcam row, before and while recording.
+    webcam_preview: gtk::Picture,
     animation: TranscribeAnimation,
     meters: [gtk::DrawingArea; 2],
     compact_meters: [gtk::DrawingArea; 2],
@@ -481,21 +484,35 @@ impl Recorder {
                 .position(|(code, _)| *code == saved)
                 .unwrap_or(0) as u32,
         );
-        let webcam_devices = crate::webcam::devices();
-        let mut webcam_labels = vec!["Off"];
-        webcam_labels.extend(webcam_devices.iter().map(|(_, name)| name.as_str()));
-        let webcam_row = adw::ComboRow::builder()
+        let webcam_camera = crate::webcam::pick(&crate::webcam::devices(), &settings::load_webcam());
+        let webcam_row = adw::SwitchRow::builder()
             .title("Webcam")
-            .subtitle("Recorded as webcam.mp4 next to the audio")
-            .model(&gtk::StringList::new(&webcam_labels))
+            .subtitle(match &webcam_camera {
+                Some((_, name)) => format!("{name}, recorded as webcam.mp4"),
+                None => "No camera found".to_owned(),
+            })
+            .active(webcam_camera.is_some() && settings::load_webcam_on())
+            .sensitive(webcam_camera.is_some())
             .build();
-        let saved = settings::load_webcam();
-        webcam_row.set_selected(
-            webcam_devices
-                .iter()
-                .position(|(_, name)| *name == saved)
-                .map_or(0, |i| i + 1) as u32,
-        );
+        let webcam_preview = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .width_request(96)
+            .height_request(54)
+            .valign(gtk::Align::Center)
+            .css_classes(["webcam-preview"])
+            .visible(false)
+            .build();
+        webcam_preview.set_overflow(gtk::Overflow::Hidden);
+        webcam_row.add_prefix(&webcam_preview);
+        let (frames_tx, frames_rx) = async_channel::bounded::<Vec<u8>>(2);
+        let picture = webcam_preview.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(frame) = frames_rx.recv().await {
+                if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(frame)) {
+                    picture.set_paintable(Some(&texture));
+                }
+            }
+        });
         group.add(&title_row);
         group.add(&format_row);
         group.add(&language_row);
@@ -829,8 +846,9 @@ impl Recorder {
             format_row,
             language_row,
             webcam_row,
-            webcam_devices,
-            webcam: crate::webcam::Webcam::default(),
+            webcam_camera,
+            webcam: crate::webcam::Webcam::new(frames_tx),
+            webcam_preview,
             animation,
             meters,
             compact_meters,
@@ -1059,10 +1077,13 @@ impl Recorder {
         // Ctrl+Q goes through the same check as the close button.
 
         let weak = Rc::downgrade(self);
-        self.webcam_row.connect_selected_notify(move |_| {
+        self.webcam_row.connect_active_notify(move |row| {
             if let Some(r) = weak.upgrade() {
-                let name = r.selected_webcam().map(|(_, name)| name).unwrap_or_default();
-                settings::save_webcam(&name);
+                settings::save_webcam_on(row.is_active());
+                if let Some((_, name)) = &r.webcam_camera {
+                    settings::save_webcam(name);
+                }
+                r.update_preview();
             }
         });
 
@@ -1525,10 +1546,28 @@ impl Recorder {
         });
     }
 
-    /// The camera picked to record, as (device, name); None when it is off.
+    /// The preview shows the camera while the toggle is on and the recording
+    /// page is on screen; a paused recording leaves its last frame, dimmed.
+    /// Nowhere else is the camera on.
+    fn update_preview(&self) {
+        let on = self.webcam_camera.is_some() && self.webcam_row.is_active();
+        let on_page = !self.compact.get()
+            && self.layout.visible_child_name().as_deref() == Some("record");
+        self.webcam_preview.set_visible(on);
+        self.webcam_preview
+            .set_opacity(if self.paused.get() { 0.4 } else { 1.0 });
+        if !on {
+            self.webcam_preview.set_paintable(None::<&gtk::gdk::Paintable>);
+        }
+        if matches!(self.state.get(), State::Idle | State::Done) {
+            let device = self.webcam_camera.as_ref().map(|(device, _)| device.as_path());
+            self.webcam.preview(device.filter(|_| on && on_page));
+        }
+    }
+
+    /// The camera to record, as (device, name); None when the toggle is off.
     fn selected_webcam(&self) -> Option<(PathBuf, String)> {
-        let index = usize::try_from(self.webcam_row.selected()).ok()?;
-        index.checked_sub(1).and_then(|i| self.webcam_devices.get(i).cloned())
+        self.webcam_camera.clone().filter(|_| self.webcam_row.is_active())
     }
 
     /// Opens the notes in `path` next to the recording page.
@@ -1557,6 +1596,7 @@ impl Recorder {
         self.view.set_size_request(if beside_recorder { FULL_SIZE.0 } else { -1 }, -1);
         self.notes.widget.set_hexpand(beside_recorder);
         self.notes.widget.set_size_request(if shown && done_page { DONE_NOTES_WIDTH } else { -1 }, -1);
+        self.update_preview();
         shown
     }
 
@@ -1598,8 +1638,9 @@ impl Recorder {
     fn render(&self) {
         let state = self.state.get();
         let recording = state == State::Recording;
-        self.webcam_row
-            .set_sensitive(matches!(state, State::Idle | State::Done));
+        self.webcam_row.set_sensitive(
+            self.webcam_camera.is_some() && matches!(state, State::Idle | State::Done),
+        );
         self.dot.set_visible(recording);
         self.compact_button.set_visible(recording);
         self.compact_action.set_enabled(recording);
@@ -1790,6 +1831,7 @@ impl Recorder {
         } else {
             self.webcam.resume();
         }
+        self.update_preview();
         self.freeze_meters(self.paused.get());
         self.set_state(State::Recording);
         self.tick();
@@ -3865,6 +3907,7 @@ fn load_css() {
                                 border: 1px solid alpha(currentColor, 0.25); font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", monospace;
                                 font-size: 13px; color: alpha(currentColor, 0.6); }
          .notes-toggle:hover { color: currentColor; }
+         .webcam-preview { border-radius: 6px; background: black; margin: 6px 4px 6px 0; }
          .notes-text { font-family: \"IBM Plex Mono\", \"JetBrainsMono Nerd Font\", \"JetBrains Mono\", monospace;
                               font-size: 21px; line-height: 1.6; background: transparent; caret-color: currentColor; }
          .notes-text text { background: transparent; }

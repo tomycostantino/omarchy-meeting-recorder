@@ -63,13 +63,22 @@ pub fn save_language(code: &str) {
     save("language", code);
 }
 
-/// The name of the webcam to record, "" for none.
+/// The camera last recorded with, "" when there was none.
 pub fn load_webcam() -> String {
     load()["webcam"].as_str().unwrap_or_default().to_owned()
 }
 
 pub fn save_webcam(name: &str) {
     save("webcam", name);
+}
+
+/// Whether the webcam toggle is on.
+pub fn load_webcam_on() -> bool {
+    load()["webcam_on"].as_str() == Some("yes")
+}
+
+pub fn save_webcam_on(on: bool) {
+    save("webcam_on", if on { "yes" } else { "no" });
 }
 
 /// What the mic side is called in new transcripts, "You" until you change it.
